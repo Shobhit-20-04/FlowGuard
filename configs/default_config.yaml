@@ -102,7 +102,7 @@ evaluation_metrics:
     - "selective_accuracy"    # Accuracy evaluated exclusively on accepted decisions
     - "risk_reduction_factor"
   calibration:
-    - "expected_calibration_error" (ECE)
+    - "expected_calibration_error" # ECE
     - "brier_score"
   efficiency:
     - "inference_latency_microseconds_per_flow"
