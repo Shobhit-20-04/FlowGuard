@@ -1,5 +1,23 @@
-# Private research-paper collection — never commit to GitHub
+# FlowGuard: Git Ignore Rules
+
+# Private research-paper collection & literature tracking — NEVER commit to GitHub
 /paper/
+
+# Large Datasets & Processed Flows
+data/raw/
+data/processed/
+*.parquet
+*.pcap
+*.pcapng
+
+# Experiment Artifacts & Model Checkpoints
+experiments/models/
+experiments/results/
+experiments/figures/
+*.joblib
+*.pkl
+*.pt
+*.pth
 
 # Python
 __pycache__/
@@ -7,7 +25,6 @@ __pycache__/
 *$py.class
 *.so
 .Python
-env/
 build/
 develop-eggs/
 dist/
@@ -28,13 +45,20 @@ wheels/
 .venv/
 venv/
 ENV/
+env/
 
-# IDE & Editor files
+# Pytest & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs & System
+*.log
+.DS_Store
+Thumbs.db
+
+# IDE & Editor
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# OS generated files
-.DS_Store
-Thumbs.db

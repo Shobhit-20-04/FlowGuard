@@ -1,0 +1,109 @@
+# =====================================================================
+# FlowGuard: Master Experiment Configuration
+# Project: Sampling-Aware Network Intrusion Detection (SAFE-3WD)
+# =====================================================================
+
+project:
+  name: "FlowGuard"
+  version: "1.0.0"
+  random_seed: 42
+  deterministic: true
+  num_workers: 4
+
+paths:
+  raw_data_dir: "data/raw"
+  processed_data_dir: "data/processed"
+  models_dir: "experiments/models"
+  results_dir: "experiments/results"
+  figures_dir: "experiments/figures"
+
+datasets:
+  active: "cic_ids_2017" # Options: cic_ids_2017, cse_cic_ids_2018, nsl_kdd
+  cic_ids_2017:
+    path: "data/raw/cic_ids_2017.parquet"
+    target_col: "Label"
+    binary_mapping:
+      BENIGN: 0
+      ATTACK: 1
+    test_split_ratio: 0.20
+    calibration_split_ratio: 0.15 # Split from train for threshold tuning
+
+sampling_degradation:
+  mechanisms:
+    - name: "random_packet_sampling"
+      enabled: true
+      sampling_rates: [0.10, 0.05, 0.02, 0.01] # 1:10, 1:20, 1:50, 1:100
+      
+    - name: "periodic_packet_sampling"
+      enabled: true
+      periods: [10, 20, 50, 100] # Every k-th packet
+      
+    - name: "burst_packet_loss"
+      enabled: true
+      model: "gilbert_elliott"
+      loss_rates: [0.02, 0.05, 0.10, 0.15]
+      mean_burst_lengths: [3, 5, 8]
+      
+    - name: "direction_biased_sampling"
+      enabled: true
+      forward_sampling_rates: [0.10, 0.05]
+      backward_sampling_rates: [0.02, 0.01] # Asymmetric link sampling
+
+uncertainty_model:
+  num_monte_carlo_draws: 30 # S = 30 plausible true flow reconstructions per sampled flow
+  distribution_type: "negative_binomial" # For packet counts; gamma/lognormal for volumes & durations
+  preserve_correlation: true # Cholesky / Copula correlation preservation across features
+  alpha_confidence: 0.95 # Coverage level for credible intervals
+
+base_classifiers:
+  selected: "lightgbm" # Options: lightgbm, random_forest, mlp, xgboost
+  lightgbm:
+    n_estimators: 300
+    learning_rate: 0.05
+    num_leaves: 63
+    max_depth: -1
+    subsample: 0.8
+    colsample_bytree: 0.8
+    random_state: 42
+  random_forest:
+    n_estimators: 200
+    max_depth: 20
+    min_samples_split: 5
+    random_state: 42
+
+three_way_decision_policy:
+  policy_type: "SAFE_3WD"
+  optimization_target: "cost_sensitive_risk"
+  # Calibrated on validation set
+  default_tau_safe: 0.20 # R_max < tau_safe => Classify Benign
+  default_tau_attack: 0.80 # R_min > tau_attack => Classify Attack
+  # Flows whose range overlaps [tau_safe, tau_attack] or variance > max_variance => INVESTIGATE
+  max_acceptable_variance: 0.04
+  investigation_cost_ratio: 0.10 # Relative operational cost of inspecting vs false negative
+
+baselines:
+  run_oblivious: true          # Standard classifier on sampled flows without correction
+  run_imputation: true         # MICE / Autoencoder feature imputation
+  run_data_augmented: true     # Model retrained with multi-rate sampled synthetic flows
+  run_mc_dropout: true         # Standard MC-Dropout / Deep Ensemble uncertainty without sampling model
+  run_flowguard: true          # Proposed SAFE-3WD mechanism
+
+evaluation_metrics:
+  classification:
+    - "accuracy"
+    - "precision"
+    - "recall"
+    - "f1_score"
+    - "false_positive_rate"
+    - "false_negative_rate"
+  selective_decision:
+    - "coverage"              # (N_benign + N_attack) / N_total
+    - "investigation_rate"    # N_investigate / N_total
+    - "selective_accuracy"    # Accuracy evaluated exclusively on accepted decisions
+    - "risk_reduction_factor"
+  calibration:
+    - "expected_calibration_error" (ECE)
+    - "brier_score"
+  efficiency:
+    - "inference_latency_microseconds_per_flow"
+    - "memory_footprint_mb"
