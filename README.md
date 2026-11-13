@@ -186,7 +186,29 @@ Under **Step 3 (Milestone 1)**, FlowGuard establishes the empirical baseline cei
 
 ---
 
-## 6. Installation & Quickstart
+## 6. Milestone 2 Results: SDUM & Feature Uncertainty Propagation
+
+Under **Step 4 (Milestone 2)**, FlowGuard introduces the **Sampling Distortion & Uncertainty Model (SDUM)** and the **Uncertainty Propagation Engine**:
+1. **Model Generalization Audit:** Verifies that base classifiers are well-regularized and optimal ($\Delta_{\text{Gen}} = 0.000\%$, with distributed feature importance $HHI = 0.3276$).
+2. **Empirical Risk Interval Propagation:** Evaluates $S = 30$ Monte Carlo plausible flow reconstructions per observed flow, quantifying the widening of predictive variance $\sigma_R^2$ and epistemic interval spread $\Delta R = R_{\max} - R_{\min}$.
+
+### Empirical Uncertainty Propagation Benchmark (S = 30 Realizations)
+
+| Packet Sampling Rate ($p$) | Ingestion Decimation | Mean Risk Spread ($\Delta R$) | Predictive Variance ($\sigma_R^2$) | Ambiguous Flows ($R_{\min} < 0.5 < R_{\max}$) | Inference Latency ($\mu$s/flow) |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| **$p = 1.00$** | Complete (1:1) | **0.0000** | **0.000000** | **0.00%** | **29.3 $\mu$s** |
+| **$p = 0.50$** | 1 in 2 | 0.4247 | 0.100507 | 42.70% | 101.8 $\mu$s |
+| **$p = 0.20$** | 1 in 5 | 0.4817 | 0.114494 | 48.45% | 120.1 $\mu$s |
+| **$p = 0.10$** | 1 in 10 | 0.6011 | 0.143162 | 60.50% | 117.9 $\mu$s |
+| **$p = 0.05$** | 1 in 20 | 0.7730 | 0.184125 | 77.85% | 160.8 $\mu$s |
+| **$p = 0.02$** | 1 in 50 | 0.9172 | 0.218158 | 92.40% | 116.4 $\mu$s |
+| **$p = 0.01$** | 1 in 100 | **0.9657** | **0.229583** | **97.30%** | **116.8 $\mu$s** |
+
+> **Key Takeaway:** Rather than forcing an overconfident point guess on decimated traffic (which caused 90.16% false alarms in the oblivious baseline), SDUM derives a rigorous epistemic interval $[R_{\min}, R_{\max}]$. For unambiguous high-volume attacks and streaming flows, the interval is tightly bounded ($[0.99, 1.00]$ or $[0.00, 0.01]$). For sparse, ambiguous flows, the interval widens up to $\Delta R = 0.9657$, signaling to **SAFE-3WD** that the flow must be deferred to the investigation pathway.
+
+---
+
+## 7. Installation & Quickstart
 
 ### Prerequisites
 - Windows 10/11, Linux, or macOS
@@ -215,7 +237,7 @@ pytest tests/ -v
 
 ---
 
-## 7. Benchmark Datasets & Comparative Baselines
+## 8. Benchmark Datasets & Comparative Baselines
 
 ### Evaluated Benchmark Datasets
 - **CIC-IDS2017:** Canadian Institute for Cybersecurity multi-day intrusion dataset.
@@ -231,7 +253,7 @@ pytest tests/ -v
 
 ---
 
-## 8. Documentation & Project Assets
+## 9. Documentation & Project Assets
 
 The repository includes presentation materials designed for academic evaluation and thesis defense:
 - **Faculty Presentation:** [FlowGuard_Faculty_Presentation.pptx](FlowGuard_Faculty_Presentation.pptx) — A light-themed, widescreen 10-slide academic deck detailing the research gaps, mathematical formulations, and SAFE-3WD novelty with comprehensive speaker notes.
@@ -242,7 +264,7 @@ The repository includes presentation materials designed for academic evaluation 
 
 ---
 
-## 9. Citation & Contact
+## 10. Citation & Contact
 
 If you use FlowGuard in your research or find this framework useful, please cite this project:
 
