@@ -15,6 +15,7 @@ from flowguard.data.schema import RAW_COLUMN_MAP
 class SyntheticFlowGenerator:
     """
     Generates realistic synthetic flow datasets matching the CICFlowMeter 80-feature schema.
+    Eliminates artificial shortcut constants to guarantee authentic degradation under decimation.
     """
     def __init__(self, seed: int = 42):
         self.rng = np.random.default_rng(seed)
@@ -42,21 +43,64 @@ class SyntheticFlowGenerator:
         rows = []
         labels = []
 
-        # 1. Generate Benign Traffic (Normal browsing, streaming, DNS, web API)
+        window_sizes = [8192, 14600, 29200, 65535]
+
+        # 1. Generate Benign Traffic (DNS/NTP, Web/API, Bulk streaming)
         for _ in range(n_benign):
-            # Packet counts: Log-normal distribution
-            fwd_pkts = int(np.clip(self.rng.lognormal(mean=2.2, sigma=0.8), 2, 2000))
-            bwd_pkts = int(np.clip(self.rng.lognormal(mean=2.4, sigma=0.9), 1, 3000))
-            
-            # Packet sizes: Mix of ACKs (40-60B) and data MTU chunks (1460B)
-            avg_fwd_len = float(self.rng.uniform(60, 800))
-            avg_bwd_len = float(self.rng.uniform(100, 1400))
+            subtype = self.rng.choice(["dns_short", "web", "streaming"], p=[0.25, 0.55, 0.20])
+
+            if subtype == "dns_short":
+                # Single-transaction / DNS / NTP: 1-2 packets, 0-1 responses
+                fwd_pkts = int(self.rng.integers(1, 3))
+                bwd_pkts = int(self.rng.choice([0, 1], p=[0.25, 0.75]))
+                avg_fwd_len = float(self.rng.uniform(45, 95))
+                avg_bwd_len = float(self.rng.uniform(60, 180)) if bwd_pkts > 0 else 0.0
+                tot_pkts = fwd_pkts + bwd_pkts
+                duration_us = float(self.rng.uniform(500, 45_000)) if tot_pkts > 1 else 0.0
+                fin_flag = 0
+                syn_flag = 1
+                ack_flag = 1 if bwd_pkts > 0 else 0
+                psh_flag = 0
+
+            elif subtype == "web":
+                # Interactive browsing / REST APIs: 4-35 fwd, 3-50 bwd
+                fwd_pkts = int(np.clip(self.rng.lognormal(mean=2.5, sigma=0.6), 4, 40))
+                bwd_pkts = int(np.clip(self.rng.lognormal(mean=2.8, sigma=0.7), 3, 60))
+                avg_fwd_len = float(self.rng.uniform(80, 450))
+                avg_bwd_len = float(self.rng.uniform(180, 1100))
+                tot_pkts = fwd_pkts + bwd_pkts
+                duration_us = float(np.clip(self.rng.lognormal(mean=12.5, sigma=1.2), 15_000, 4_000_000))
+                fin_flag = 1
+                syn_flag = 1
+                ack_flag = 1
+                psh_flag = int(self.rng.binomial(1, 0.6))
+
+            else:  # streaming / bulk download
+                fwd_pkts = int(np.clip(self.rng.lognormal(mean=3.5, sigma=0.6), 20, 250))
+                bwd_pkts = int(np.clip(self.rng.lognormal(mean=4.2, sigma=0.7), 30, 600))
+                avg_fwd_len = float(self.rng.uniform(55, 90))  # mostly ACKs
+                avg_bwd_len = float(self.rng.uniform(1050, 1460))  # full MTU chunks
+                tot_pkts = fwd_pkts + bwd_pkts
+                duration_us = float(np.clip(self.rng.lognormal(mean=14.5, sigma=1.2), 150_000, 25_000_000))
+                fin_flag = 1
+                syn_flag = 1
+                ack_flag = 1
+                psh_flag = int(self.rng.binomial(1, 0.8))
+
             total_fwd_bytes = fwd_pkts * avg_fwd_len
             total_bwd_bytes = bwd_pkts * avg_bwd_len
+            dur_sec = max(1e-4, duration_us / 1e6) if tot_pkts > 1 else 0.0
 
-            duration_us = float(self.rng.exponential(scale=2_500_000)) # ~2.5s duration
-            iat_mean = duration_us / max(1, (fwd_pkts + bwd_pkts - 1))
-            iat_std = float(iat_mean * self.rng.uniform(0.5, 1.5))
+            iat_mean = duration_us / max(1, (tot_pkts - 1)) if tot_pkts > 1 else 0.0
+            iat_std = float(iat_mean * self.rng.uniform(0.4, 1.2)) if tot_pkts > 1 else 0.0
+            iat_min = max(1.0, float(iat_mean * self.rng.uniform(0.01, 0.15))) if tot_pkts > 1 else 0.0
+            iat_max = float(iat_mean * self.rng.uniform(1.8, 3.5)) if tot_pkts > 1 else 0.0
+
+            pkt_rate = tot_pkts / dur_sec if dur_sec > 0 else 0.0
+            byte_rate = (total_fwd_bytes + total_bwd_bytes) / dur_sec if dur_sec > 0 else 0.0
+
+            win_fwd = int(self.rng.choice(window_sizes))
+            win_bwd = int(self.rng.choice(window_sizes)) if bwd_pkts > 0 else 0
 
             rows.append({
                 "Flow Duration": duration_us,
@@ -64,67 +108,67 @@ class SyntheticFlowGenerator:
                 "Total Backward Packets": bwd_pkts,
                 "Total Length of Fwd Packets": total_fwd_bytes,
                 "Total Length of Bwd Packets": total_bwd_bytes,
-                "Fwd Packet Length Max": avg_fwd_len * 1.5,
+                "Fwd Packet Length Max": avg_fwd_len * 1.4,
                 "Fwd Packet Length Min": 40.0,
                 "Fwd Packet Length Mean": avg_fwd_len,
-                "Fwd Packet Length Std": avg_fwd_len * 0.4,
-                "Bwd Packet Length Max": avg_bwd_len * 1.2,
-                "Bwd Packet Length Min": 40.0,
+                "Fwd Packet Length Std": avg_fwd_len * 0.35 if fwd_pkts > 1 else 0.0,
+                "Bwd Packet Length Max": avg_bwd_len * 1.3 if bwd_pkts > 0 else 0.0,
+                "Bwd Packet Length Min": 40.0 if bwd_pkts > 0 else 0.0,
                 "Bwd Packet Length Mean": avg_bwd_len,
-                "Bwd Packet Length Std": avg_bwd_len * 0.3,
-                "Flow Bytes/s": (total_fwd_bytes + total_bwd_bytes) / max(1.0, duration_us / 1e6),
-                "Flow Packets/s": (fwd_pkts + bwd_pkts) / max(1.0, duration_us / 1e6),
+                "Bwd Packet Length Std": avg_bwd_len * 0.30 if bwd_pkts > 1 else 0.0,
+                "Flow Bytes/s": byte_rate,
+                "Flow Packets/s": pkt_rate,
                 "Flow IAT Mean": iat_mean,
                 "Flow IAT Std": iat_std,
-                "Flow IAT Max": iat_mean * 3.0,
-                "Flow IAT Min": max(1.0, iat_mean * 0.1),
-                "Fwd IAT Total": duration_us * 0.9,
-                "Fwd IAT Mean": duration_us / max(1, fwd_pkts),
+                "Flow IAT Max": iat_max,
+                "Flow IAT Min": iat_min,
+                "Fwd IAT Total": duration_us * 0.9 if fwd_pkts > 1 else 0.0,
+                "Fwd IAT Mean": duration_us / max(1, fwd_pkts) if fwd_pkts > 1 else 0.0,
                 "Fwd IAT Std": iat_std,
-                "Fwd IAT Max": iat_mean * 2.5,
-                "Fwd IAT Min": 5.0,
-                "Bwd IAT Total": duration_us * 0.8,
-                "Bwd IAT Mean": duration_us / max(1, bwd_pkts),
-                "Bwd IAT Std": iat_std,
-                "Bwd IAT Max": iat_mean * 2.5,
-                "Bwd IAT Min": 5.0,
-                "Fwd PSH Flags": int(self.rng.binomial(1, 0.3)),
+                "Fwd IAT Max": iat_max,
+                "Fwd IAT Min": iat_min,
+                "Bwd IAT Total": duration_us * 0.8 if bwd_pkts > 1 else 0.0,
+                "Bwd IAT Mean": duration_us / max(1, bwd_pkts) if bwd_pkts > 1 else 0.0,
+                "Bwd IAT Std": iat_std if bwd_pkts > 1 else 0.0,
+                "Bwd IAT Max": iat_max if bwd_pkts > 1 else 0.0,
+                "Bwd IAT Min": iat_min if bwd_pkts > 1 else 0.0,
+                "Fwd PSH Flags": psh_flag,
                 "Bwd PSH Flags": 0,
                 "Fwd URG Flags": 0,
                 "Bwd URG Flags": 0,
                 "Fwd Header Length": fwd_pkts * 20,
                 "Bwd Header Length": bwd_pkts * 20,
-                "Fwd Packets/s": fwd_pkts / max(1.0, duration_us / 1e6),
-                "Bwd Packets/s": bwd_pkts / max(1.0, duration_us / 1e6),
+                "Fwd Packets/s": fwd_pkts / dur_sec if dur_sec > 0 else 0.0,
+                "Bwd Packets/s": bwd_pkts / dur_sec if dur_sec > 0 else 0.0,
                 "Min Packet Length": 40.0,
-                "Max Packet Length": 1460.0,
-                "Packet Length Mean": (total_fwd_bytes + total_bwd_bytes) / max(1, (fwd_pkts + bwd_pkts)),
-                "Packet Length Std": 250.0,
-                "Packet Length Variance": 250.0 ** 2,
-                "FIN Flag Count": 1,
-                "SYN Flag Count": 1,
+                "Max Packet Length": 1460.0 if subtype == "streaming" else 1100.0,
+                "Packet Length Mean": (total_fwd_bytes + total_bwd_bytes) / max(1, tot_pkts),
+                "Packet Length Std": 220.0 if tot_pkts > 2 else 0.0,
+                "Packet Length Variance": (220.0 ** 2) if tot_pkts > 2 else 0.0,
+                "FIN Flag Count": fin_flag,
+                "SYN Flag Count": syn_flag,
                 "RST Flag Count": 0,
-                "PSH Flag Count": 1,
-                "ACK Flag Count": 1,
+                "PSH Flag Count": psh_flag,
+                "ACK Flag Count": ack_flag,
                 "URG Flag Count": 0,
                 "CWE Flag Count": 0,
                 "ECE Flag Count": 0,
                 "Down/Up Ratio": float(bwd_pkts / max(1, fwd_pkts)),
-                "Average Packet Size": (total_fwd_bytes + total_bwd_bytes) / max(1, (fwd_pkts + bwd_pkts)),
+                "Average Packet Size": (total_fwd_bytes + total_bwd_bytes) / max(1, tot_pkts),
                 "Avg Fwd Segment Size": avg_fwd_len,
                 "Avg Bwd Segment Size": avg_bwd_len,
                 "Subflow Fwd Packets": fwd_pkts,
                 "Subflow Fwd Bytes": total_fwd_bytes,
                 "Subflow Bwd Packets": bwd_pkts,
                 "Subflow Bwd Bytes": total_bwd_bytes,
-                "Init_Win_bytes_forward": 29200,
-                "Init_Win_bytes_backward": 65535,
-                "act_data_pkt_fwd": max(1, int(fwd_pkts * 0.7)),
+                "Init_Win_bytes_forward": win_fwd,
+                "Init_Win_bytes_backward": win_bwd,
+                "act_data_pkt_fwd": max(0, fwd_pkts - 1),
                 "min_seg_size_forward": 20,
-                "Active Mean": duration_us * 0.7,
-                "Active Std": 1000.0,
-                "Active Max": duration_us * 0.7,
-                "Active Min": duration_us * 0.7,
+                "Active Mean": duration_us * 0.7 if duration_us > 0 else 0.0,
+                "Active Std": 500.0 if duration_us > 0 else 0.0,
+                "Active Max": duration_us * 0.7 if duration_us > 0 else 0.0,
+                "Active Min": duration_us * 0.7 if duration_us > 0 else 0.0,
                 "Idle Mean": 0.0,
                 "Idle Std": 0.0,
                 "Idle Max": 0.0,
@@ -132,7 +176,7 @@ class SyntheticFlowGenerator:
             })
             labels.append("BENIGN")
 
-        # 2. Generate Attacks
+        # 2. Generate Attacks (DoS, DDoS, PortScan, Botnet)
         attack_types = list(attack_distribution.keys())
         attack_probs = list(attack_distribution.values())
 
@@ -140,44 +184,59 @@ class SyntheticFlowGenerator:
             atk_type = self.rng.choice(attack_types, p=attack_probs)
 
             if atk_type in ["DoS", "DDoS"]:
-                # Volumetric floods: high packets, tiny payloads (SYN/UDP flood), tiny IAT
-                fwd_pkts = int(self.rng.uniform(500, 15000))
-                bwd_pkts = int(self.rng.uniform(0, 5)) # Asymmetric response
-                avg_fwd_len = float(self.rng.choice([40.0, 64.0, 128.0]))
-                avg_bwd_len = 0.0 if bwd_pkts == 0 else 40.0
-                duration_us = float(self.rng.uniform(10_000, 500_000)) # Very short burst
-                iat_mean = duration_us / max(1, fwd_pkts)
-                iat_std = float(iat_mean * 0.2) # Extremely regular packet pacing
-
+                # High packet count, small payloads (40-64B), high packet rate, asymmetric
+                fwd_pkts = int(self.rng.uniform(350, 4500))
+                bwd_pkts = int(self.rng.choice([0, 1, 2], p=[0.7, 0.2, 0.1]))
+                avg_fwd_len = float(self.rng.choice([40.0, 54.0, 64.0]))
+                avg_bwd_len = 40.0 if bwd_pkts > 0 else 0.0
+                tot_pkts = fwd_pkts + bwd_pkts
+                duration_us = float(np.clip(self.rng.lognormal(mean=13.0, sigma=1.2), 30_000, 15_000_000))
+                fin_flag = 0
                 syn_flag = 1
-                ack_flag = 0 if bwd_pkts == 0 else 1
+                ack_flag = 1 if bwd_pkts > 0 else 0
+                psh_flag = 0
+
             elif atk_type == "PortScan":
-                # Reconnaissance: 1 to 3 packets per flow, high SYN flags, 0 response
+                # Rapid scans: 1-3 packets, 0-1 responses, fast probes
                 fwd_pkts = int(self.rng.integers(1, 4))
                 bwd_pkts = int(self.rng.choice([0, 1], p=[0.85, 0.15]))
                 avg_fwd_len = 40.0
                 avg_bwd_len = 40.0 if bwd_pkts > 0 else 0.0
-                duration_us = float(self.rng.uniform(100, 15_000))
-                iat_mean = duration_us / max(1, fwd_pkts)
-                iat_std = 0.0 if fwd_pkts <= 1 else float(iat_mean * 0.1)
-
+                tot_pkts = fwd_pkts + bwd_pkts
+                duration_us = float(self.rng.uniform(100, 10_000)) if tot_pkts > 1 else 0.0
+                fin_flag = 0
                 syn_flag = 1
                 ack_flag = 0
-            else: # Botnet / C2
-                # Periodic heartbeat pulses
-                fwd_pkts = int(self.rng.integers(4, 15))
-                bwd_pkts = int(self.rng.integers(4, 15))
-                avg_fwd_len = float(self.rng.uniform(150, 400))
-                avg_bwd_len = float(self.rng.uniform(150, 400))
-                duration_us = float(self.rng.uniform(1_000_000, 10_000_000))
-                iat_mean = duration_us / max(1, fwd_pkts)
-                iat_std = float(iat_mean * 0.05) # Strict periodic timer
+                psh_flag = 0
 
+            else:  # Botnet / C2
+                # Periodic beacon pulses: 4-15 packets each way, regular intervals
+                fwd_pkts = int(self.rng.integers(5, 18))
+                bwd_pkts = int(self.rng.integers(5, 18))
+                avg_fwd_len = float(self.rng.uniform(140, 350))
+                avg_bwd_len = float(self.rng.uniform(140, 350))
+                tot_pkts = fwd_pkts + bwd_pkts
+                duration_us = float(np.clip(self.rng.lognormal(mean=13.5, sigma=1.0), 100_000, 20_000_000))
+                fin_flag = 1
                 syn_flag = 1
                 ack_flag = 1
+                psh_flag = 1
 
             total_fwd_bytes = fwd_pkts * avg_fwd_len
             total_bwd_bytes = bwd_pkts * avg_bwd_len
+            dur_sec = max(1e-4, duration_us / 1e6) if tot_pkts > 1 else 0.0
+
+            iat_mean = duration_us / max(1, (tot_pkts - 1)) if tot_pkts > 1 else 0.0
+            # Attacks have rigid pacing (low IAT variance)
+            iat_std = float(iat_mean * self.rng.uniform(0.05, 0.25)) if tot_pkts > 1 else 0.0
+            iat_min = max(1.0, float(iat_mean * self.rng.uniform(0.01, 0.15))) if tot_pkts > 1 else 0.0
+            iat_max = float(iat_mean * self.rng.uniform(1.2, 2.0)) if tot_pkts > 1 else 0.0
+
+            pkt_rate = tot_pkts / dur_sec if dur_sec > 0 else 0.0
+            byte_rate = (total_fwd_bytes + total_bwd_bytes) / dur_sec if dur_sec > 0 else 0.0
+
+            win_fwd = int(self.rng.choice(window_sizes))
+            win_bwd = int(self.rng.choice(window_sizes)) if bwd_pkts > 0 else 0
 
             rows.append({
                 "Flow Duration": duration_us,
@@ -185,67 +244,67 @@ class SyntheticFlowGenerator:
                 "Total Backward Packets": bwd_pkts,
                 "Total Length of Fwd Packets": total_fwd_bytes,
                 "Total Length of Bwd Packets": total_bwd_bytes,
-                "Fwd Packet Length Max": avg_fwd_len,
+                "Fwd Packet Length Max": avg_fwd_len * 1.2,
                 "Fwd Packet Length Min": 40.0,
                 "Fwd Packet Length Mean": avg_fwd_len,
-                "Fwd Packet Length Std": 5.0,
-                "Bwd Packet Length Max": avg_bwd_len,
-                "Bwd Packet Length Min": 0.0 if bwd_pkts == 0 else 40.0,
+                "Fwd Packet Length Std": 5.0 if fwd_pkts > 1 else 0.0,
+                "Bwd Packet Length Max": avg_bwd_len if bwd_pkts > 0 else 0.0,
+                "Bwd Packet Length Min": 40.0 if bwd_pkts > 0 else 0.0,
                 "Bwd Packet Length Mean": avg_bwd_len,
-                "Bwd Packet Length Std": 2.0,
-                "Flow Bytes/s": (total_fwd_bytes + total_bwd_bytes) / max(1.0, duration_us / 1e6),
-                "Flow Packets/s": (fwd_pkts + bwd_pkts) / max(1.0, duration_us / 1e6),
+                "Bwd Packet Length Std": 2.0 if bwd_pkts > 1 else 0.0,
+                "Flow Bytes/s": byte_rate,
+                "Flow Packets/s": pkt_rate,
                 "Flow IAT Mean": iat_mean,
                 "Flow IAT Std": iat_std,
-                "Flow IAT Max": iat_mean * 1.5,
-                "Flow IAT Min": max(1.0, iat_mean * 0.5),
-                "Fwd IAT Total": duration_us,
-                "Fwd IAT Mean": duration_us / max(1, fwd_pkts),
+                "Flow IAT Max": iat_max,
+                "Flow IAT Min": iat_min,
+                "Fwd IAT Total": duration_us * 0.9 if fwd_pkts > 1 else 0.0,
+                "Fwd IAT Mean": duration_us / max(1, fwd_pkts) if fwd_pkts > 1 else 0.0,
                 "Fwd IAT Std": iat_std,
-                "Fwd IAT Max": iat_mean * 1.5,
-                "Fwd IAT Min": 1.0,
-                "Bwd IAT Total": duration_us * 0.5,
-                "Bwd IAT Mean": duration_us / max(1, max(1, bwd_pkts)),
-                "Bwd IAT Std": iat_std,
-                "Bwd IAT Max": iat_mean,
-                "Bwd IAT Min": 1.0,
-                "Fwd PSH Flags": 0,
+                "Fwd IAT Max": iat_max,
+                "Fwd IAT Min": iat_min,
+                "Bwd IAT Total": duration_us * 0.8 if bwd_pkts > 1 else 0.0,
+                "Bwd IAT Mean": duration_us / max(1, bwd_pkts) if bwd_pkts > 1 else 0.0,
+                "Bwd IAT Std": iat_std if bwd_pkts > 1 else 0.0,
+                "Bwd IAT Max": iat_max if bwd_pkts > 1 else 0.0,
+                "Bwd IAT Min": iat_min if bwd_pkts > 1 else 0.0,
+                "Fwd PSH Flags": psh_flag,
                 "Bwd PSH Flags": 0,
                 "Fwd URG Flags": 0,
                 "Bwd URG Flags": 0,
                 "Fwd Header Length": fwd_pkts * 20,
                 "Bwd Header Length": bwd_pkts * 20,
-                "Fwd Packets/s": fwd_pkts / max(1.0, duration_us / 1e6),
-                "Bwd Packets/s": bwd_pkts / max(1.0, duration_us / 1e6),
+                "Fwd Packets/s": fwd_pkts / dur_sec if dur_sec > 0 else 0.0,
+                "Bwd Packets/s": bwd_pkts / dur_sec if dur_sec > 0 else 0.0,
                 "Min Packet Length": 40.0,
                 "Max Packet Length": max(avg_fwd_len, avg_bwd_len, 40.0),
-                "Packet Length Mean": (total_fwd_bytes + total_bwd_bytes) / max(1, (fwd_pkts + bwd_pkts)),
-                "Packet Length Std": 10.0,
-                "Packet Length Variance": 100.0,
-                "FIN Flag Count": 0,
+                "Packet Length Mean": (total_fwd_bytes + total_bwd_bytes) / max(1, tot_pkts),
+                "Packet Length Std": 8.0 if tot_pkts > 2 else 0.0,
+                "Packet Length Variance": 64.0 if tot_pkts > 2 else 0.0,
+                "FIN Flag Count": fin_flag,
                 "SYN Flag Count": syn_flag,
                 "RST Flag Count": 0,
-                "PSH Flag Count": 0,
+                "PSH Flag Count": psh_flag,
                 "ACK Flag Count": ack_flag,
                 "URG Flag Count": 0,
                 "CWE Flag Count": 0,
                 "ECE Flag Count": 0,
                 "Down/Up Ratio": float(bwd_pkts / max(1, fwd_pkts)),
-                "Average Packet Size": (total_fwd_bytes + total_bwd_bytes) / max(1, (fwd_pkts + bwd_pkts)),
+                "Average Packet Size": (total_fwd_bytes + total_bwd_bytes) / max(1, tot_pkts),
                 "Avg Fwd Segment Size": avg_fwd_len,
                 "Avg Bwd Segment Size": avg_bwd_len,
                 "Subflow Fwd Packets": fwd_pkts,
                 "Subflow Fwd Bytes": total_fwd_bytes,
                 "Subflow Bwd Packets": bwd_pkts,
                 "Subflow Bwd Bytes": total_bwd_bytes,
-                "Init_Win_bytes_forward": 1024,
-                "Init_Win_bytes_backward": 0 if bwd_pkts == 0 else 1024,
+                "Init_Win_bytes_forward": win_fwd,
+                "Init_Win_bytes_backward": win_bwd,
                 "act_data_pkt_fwd": max(0, fwd_pkts - 1),
                 "min_seg_size_forward": 20,
-                "Active Mean": duration_us,
+                "Active Mean": duration_us * 0.7 if duration_us > 0 else 0.0,
                 "Active Std": 0.0,
-                "Active Max": duration_us,
-                "Active Min": duration_us,
+                "Active Max": duration_us * 0.7 if duration_us > 0 else 0.0,
+                "Active Min": duration_us * 0.7 if duration_us > 0 else 0.0,
                 "Idle Mean": 0.0,
                 "Idle Std": 0.0,
                 "Idle Max": 0.0,
@@ -255,7 +314,6 @@ class SyntheticFlowGenerator:
 
         df = pd.DataFrame(rows)
         df["Label"] = labels
-
-        # Shuffle deterministically
-        df = df.sample(frac=1.0, random_state=42).reset_index(drop=True)
+        # Randomly shuffle rows
+        df = df.sample(frac=1.0, random_state=int(self.rng.integers(0, 100000))).reset_index(drop=True)
         return df

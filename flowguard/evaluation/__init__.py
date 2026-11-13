@@ -1,7 +1,21 @@
 """
-FlowGuard Evaluation & Metrics
-==============================
-Calculates standard classification metrics (DR, FPR, FNR, F1),
-three-way selective metrics (Coverage, Investigation Rate, Selective Accuracy),
-and calibration metrics (Expected Calibration Error - ECE, Brier Score).
+FlowGuard Evaluation & Metrics Library
+=======================================
+
+Standard classification metrics, probability calibration (ECE),
+and selective three-way decision metrics.
 """
+
+from flowguard.evaluation.metrics import (
+    compute_brier_score,
+    compute_classification_metrics,
+    compute_expected_calibration_error,
+    compute_selective_metrics,
+)
+
+__all__ = [
+    "compute_classification_metrics",
+    "compute_expected_calibration_error",
+    "compute_brier_score",
+    "compute_selective_metrics",
+]
