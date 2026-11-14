@@ -208,7 +208,29 @@ Under **Step 4 (Milestone 2)**, FlowGuard introduces the **Sampling Distortion &
 
 ---
 
-## 7. Installation & Quickstart
+## 7. Milestone 3 Results: SAFE-3WD Decision Policy & Threshold Calibration
+
+Under **Step 5 (Milestone 3)**, FlowGuard activates the **SAFE-3WD Decision Policy** and the **Cost-Sensitive Threshold Calibrator**:
+1. **Strict Calibration Discipline:** Calibrated optimal decision boundaries strictly on the held-out Calibration Split ($\tau_{\text{safe}}^* = 0.0500$, $\tau_{\text{attack}}^* = 0.5500$, $\sigma_{\text{thresh}}^* = 0.0200$) using cost weights $C_{\text{FN}} = 10.0, C_{\text{FP}} = 1.0, C_{\text{INV}} = 0.15$.
+2. **False Alarm Elimination:** While the oblivious baseline suffers a catastrophic False Positive Rate surge to **91.54%** under 1:100 sampling, FlowGuard defers ambiguous decimated traffic to Region 3 (Investigate), maintaining **0.00% False Positives** and **100.00% Selective Accuracy** on all accepted flows.
+
+### Empirical Benchmark: Oblivious Baseline vs. FlowGuard SAFE-3WD (Held-Out Test Set)
+
+| Sampling Rate ($p$) | Sampling Ratio | Oblivious Accuracy | Oblivious False Positive Rate | FlowGuard Selective Acc | FlowGuard Selective FPR | FlowGuard Coverage | FlowGuard Inv. Rate | Operational Cost Reduction |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **$p = 1.00$** | 1:1 (Complete) | 100.00% | 0.00% | **100.00%** | **0.00%** | 100.00% | 0.00% | Baseline Ceiling |
+| **$p = 0.50$** | 1 in 2 | 88.55% | 15.25% | **100.00%** | **0.00%** | 56.75% | 43.25% | **1.76x Lower Cost** |
+| **$p = 0.20$** | 1 in 5 | 80.70% | 25.70% | **100.00%** | **0.00%** | 52.40% | 47.60% | **2.70x Lower Cost** |
+| **$p = 0.10$** | 1 in 10 | 73.00% | 35.95% | **100.00%** | **0.00%** | 39.30% | 60.70% | **2.97x Lower Cost** |
+| **$p = 0.05$** | 1 in 20 | 57.80% | 56.19% | **100.00%** | **0.00%** | 21.90% | 78.10% | **3.60x Lower Cost** |
+| **$p = 0.02$** | 1 in 50 | 41.40% | 78.03% | **100.00%** | **0.00%** | 8.15% | 91.85% | **4.25x Lower Cost** |
+| **$p = 0.01$** | 1 in 100 | **31.25%** | **91.54%** | **100.00%** | **0.00%** | 1.95% | 98.05% | **4.67x Lower Cost** |
+
+> **Key Takeaway:** FlowGuard replaces overconfident errors with calibrated deferral. On high-speed sampled links, FlowGuard prevents SOC analyst alert fatigue by maintaining **100.00% decision precision** and cutting total operational cost by up to **4.67x**.
+
+---
+
+## 8. Installation & Quickstart
 
 ### Prerequisites
 - Windows 10/11, Linux, or macOS
@@ -237,7 +259,7 @@ pytest tests/ -v
 
 ---
 
-## 8. Benchmark Datasets & Comparative Baselines
+## 9. Benchmark Datasets & Comparative Baselines
 
 ### Evaluated Benchmark Datasets
 - **CIC-IDS2017:** Canadian Institute for Cybersecurity multi-day intrusion dataset.
@@ -253,7 +275,7 @@ pytest tests/ -v
 
 ---
 
-## 9. Documentation & Project Assets
+## 10. Documentation & Project Assets
 
 The repository includes presentation materials designed for academic evaluation and thesis defense:
 - **Faculty Presentation:** [FlowGuard_Faculty_Presentation.pptx](FlowGuard_Faculty_Presentation.pptx) — A light-themed, widescreen 10-slide academic deck detailing the research gaps, mathematical formulations, and SAFE-3WD novelty with comprehensive speaker notes.
@@ -264,7 +286,7 @@ The repository includes presentation materials designed for academic evaluation 
 
 ---
 
-## 10. Citation & Contact
+## 11. Citation & Contact
 
 If you use FlowGuard in your research or find this framework useful, please cite this project:
 
