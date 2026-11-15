@@ -1,9 +1,41 @@
-"""
+r"""
 FlowGuard Sampling Distortion & Uncertainty Model (SDUM)
 ========================================================
 
 Mathematically inverts the packet sampling and decimation process to reconstruct
 an ensemble of S plausible true flows {X_hat^(1), ..., X_hat^(S)} per observed flow.
+
+Mathematical Foundations & Posterior Derivations:
+-------------------------------------------------
+Given true flow packet count N and binomial sampling probability p in (0, 1]:
+  K | N ~ Binomial(N, p)
+  P(K = k | N = k + u) = binom(k + u, k) * p^k * (1 - p)^u, where U = N - k >= 0.
+
+By Bayes' theorem, the posterior of unobserved packets U given observed k packets is:
+1. Under scale-invariant / Haldane prior P(N) \propto 1 / N (default, prior="scale_invariant"):
+   P(U = u | k, p) \propto binom(k + u, k) * p^k * (1 - p)^u * (1 / (k + u))
+                  = (1 / k) * binom(u + k - 1, u) * p^k * (1 - p)^u
+   Normalizing over u >= 0:
+     \sum_{u=0}^\infty binom(u + k - 1, u) * (1 - p)^u = p^(-k)
+   Hence:
+     P(U = u | k, p) = binom(u + k - 1, u) * p^k * (1 - p)^u  ==>  U ~ NegBin(k, p)
+   Posterior moments:
+     E[U | k, p] = k * (1 - p) / p
+     E[N | k, p] = k + E[U] = k / p
+     Var(N | k, p) = Var(U | k, p) = k * (1 - p) / (p^2)
+
+2. Under improper uniform prior P(N) \propto 1 (prior="uniform"):
+   P(U = u | k, p) \propto binom(k + u, k) * (1 - p)^u = binom(u + (k + 1) - 1, u) * (1 - p)^u
+   Normalizing over u >= 0:
+     \sum_{u=0}^\infty binom(k + u, k) * (1 - p)^u = p^(-(k + 1))
+   Hence:
+     P(U = u | k, p) = binom(u + (k + 1) - 1, u) * p^(k + 1) * (1 - p)^u  ==>  U ~ NegBin(k + 1, p)
+   Posterior moments:
+     E[U | k, p] = (k + 1) * (1 - p) / p
+     E[N | k, p] = k + E[U] = k / p + (1 - p) / p
+     Var(N | k, p) = Var(U | k, p) = (k + 1) * (1 - p) / (p^2)
+
+Both priors are fully supported and mathematically validated.
 """
 
 from typing import Dict, List, Optional, Tuple, Union
@@ -15,6 +47,16 @@ from flowguard.sampling.distortion_math import (
     inverted_count_posterior_moments,
     sampled_iat_moments,
 )
+
+# Canonical additive volume features (strictly volume/header counts, never window sizes)
+ADDITIVE_BYTE_FEATURES = {
+    "total_fwd_bytes",
+    "total_bwd_bytes",
+    "subflow_fwd_bytes",
+    "subflow_bwd_bytes",
+    "fwd_header_len",
+    "bwd_header_len",
+}
 
 
 class SamplingDistortionUncertaintyModel:
@@ -31,11 +73,16 @@ class SamplingDistortionUncertaintyModel:
         random_state: int = 42,
         preserve_correlation: bool = True,
         probe_prior: float = 0.40,
+        prior: str = "scale_invariant",
     ):
+        if prior not in ["scale_invariant", "uniform"]:
+            raise ValueError(f"Unknown prior '{prior}'. Must be 'scale_invariant' or 'uniform'.")
+
         self.n_mc_samples = n_mc_samples
         self.random_state = random_state
         self.preserve_correlation = preserve_correlation
         self.probe_prior = probe_prior
+        self.prior = prior
         self.rng = np.random.default_rng(random_state)
 
         # Learned empirical priors and correlation structures
@@ -45,6 +92,12 @@ class SamplingDistortionUncertaintyModel:
         self.empirical_stds_: Dict[str, float] = {}
         self.corr_cholesky_: Optional[np.ndarray] = None
         self.tracked_corr_cols_: List[str] = []
+
+        # Compound Gamma parameters for packet payload lengths (shape alpha, scale beta)
+        self.fwd_pkt_gamma_shape_: float = 2.0
+        self.fwd_pkt_gamma_scale_: float = 100.0
+        self.bwd_pkt_gamma_shape_: float = 2.0
+        self.bwd_pkt_gamma_scale_: float = 200.0
 
     def fit(self, X_pristine: pd.DataFrame) -> "SamplingDistortionUncertaintyModel":
         """
@@ -58,6 +111,26 @@ class SamplingDistortionUncertaintyModel:
             vals = X_pristine[col].values
             self.empirical_medians_[col] = float(np.nanmedian(vals))
             self.empirical_stds_[col] = float(np.nanstd(vals) + 1e-6)
+
+        # Fit Compound Gamma parameters for packet length distributions
+        # Mean = shape * scale, Var = shape * scale^2  ==> scale = Var / Mean, shape = Mean / scale
+        if "total_fwd_bytes" in X_pristine.columns and "total_fwd_packets" in X_pristine.columns:
+            pkts = np.maximum(1.0, X_pristine["total_fwd_packets"].values)
+            lens = np.maximum(20.0, X_pristine["total_fwd_bytes"].values / pkts)
+            mu_l = float(np.nanmean(lens))
+            var_l = float(np.nanvar(lens) + 1.0)
+            self.fwd_pkt_gamma_scale_ = max(1.0, var_l / max(1.0, mu_l))
+            self.fwd_pkt_gamma_shape_ = max(0.5, mu_l / self.fwd_pkt_gamma_scale_)
+
+        if "total_bwd_bytes" in X_pristine.columns and "total_bwd_packets" in X_pristine.columns:
+            bwd_mask = X_pristine["total_bwd_packets"].values > 0
+            if bwd_mask.any():
+                pkts_b = np.maximum(1.0, X_pristine["total_bwd_packets"].values[bwd_mask])
+                lens_b = np.maximum(20.0, X_pristine["total_bwd_bytes"].values[bwd_mask] / pkts_b)
+                mu_b = float(np.nanmean(lens_b))
+                var_b = float(np.nanvar(lens_b) + 1.0)
+                self.bwd_pkt_gamma_scale_ = max(1.0, var_b / max(1.0, mu_b))
+                self.bwd_pkt_gamma_shape_ = max(0.5, mu_b / self.bwd_pkt_gamma_scale_)
 
         # Correlation preservation across core volume and temporal features
         candidate_cols = [
@@ -131,6 +204,10 @@ class SamplingDistortionUncertaintyModel:
         sparse_mask = k_tot <= 2
         multi_mask = ~sparse_mask
 
+        # Parameter r for Negative Binomial draws based on chosen prior
+        # scale_invariant: r = k; uniform: r = k + 1
+        r_offset = 1 if self.prior == "uniform" else 0
+
         reconstructed_dfs: List[pd.DataFrame] = []
 
         # Vectorized draws for S realizations
@@ -143,71 +220,94 @@ class SamplingDistortionUncertaintyModel:
             z_sparse = self.rng.binomial(1, self.probe_prior, size=n_rows).astype(bool)
 
             # 1. Packet Count Reconstruction
-            # For multi-packet observations (k_tot > 2): unimodal Negative Binomial inversion
-            # For sparse observations (k_tot <= 2): mixture posterior
             n_hat_fwd = np.zeros(n_rows, dtype=np.int64)
             n_hat_bwd = np.zeros(n_rows, dtype=np.int64)
+            u_fwd = np.zeros(n_rows, dtype=np.int64)
+            u_bwd = np.zeros(n_rows, dtype=np.int64)
 
-            # Multi-packet flows: Negative Binomial draws
+            # Multi-packet flows: Negative Binomial draws for unobserved packets U
             if multi_mask.any():
-                missed_fwd_multi = self.rng.negative_binomial(
-                    n=np.maximum(1, k_fwd[multi_mask]), p=p
-                )
-                n_hat_fwd[multi_mask] = k_fwd[multi_mask] + missed_fwd_multi
+                fwd_n_param = np.maximum(1, k_fwd[multi_mask] + r_offset)
+                missed_fwd = self.rng.negative_binomial(n=fwd_n_param, p=p)
+                u_fwd[multi_mask] = missed_fwd
+                n_hat_fwd[multi_mask] = k_fwd[multi_mask] + missed_fwd
 
                 bwd_nonzero = (k_bwd[multi_mask] > 0)
-                missed_bwd_multi = np.zeros(int(multi_mask.sum()), dtype=np.int64)
                 if bwd_nonzero.any():
-                    missed_bwd_multi[bwd_nonzero] = self.rng.negative_binomial(
-                        n=k_bwd[multi_mask][bwd_nonzero], p=p
-                    )
-                n_hat_bwd[multi_mask] = k_bwd[multi_mask] + missed_bwd_multi
+                    idx_bwd = np.where(multi_mask)[0][bwd_nonzero]
+                    bwd_n_param = np.maximum(1, k_bwd[idx_bwd] + r_offset)
+                    missed_bwd = self.rng.negative_binomial(n=bwd_n_param, p=p)
+                    u_bwd[idx_bwd] = missed_bwd
+                    n_hat_bwd[idx_bwd] = k_bwd[idx_bwd] + missed_bwd
 
             # Sparse flows: Mixture draws
             if sparse_mask.any():
-                # Case A: Probe hypothesis (Z = 1) -> small true count (1 to 3 packets)
+                # Case A: Probe hypothesis (Z = 1) -> small true count (preserved or +0-1 packets)
                 probe_indices = sparse_mask & z_sparse
                 if probe_indices.any():
                     n_hat_fwd[probe_indices] = np.maximum(1, k_fwd[probe_indices])
                     n_hat_bwd[probe_indices] = k_bwd[probe_indices]
+                    u_fwd[probe_indices] = n_hat_fwd[probe_indices] - k_fwd[probe_indices]
+                    u_bwd[probe_indices] = 0
 
                 # Case B: Decimated session hypothesis (Z = 0) -> true count was substantial
                 session_indices = sparse_mask & (~z_sparse)
                 if session_indices.any():
-                    missed_fwd_sess = self.rng.negative_binomial(n=1, p=p, size=int(session_indices.sum()))
-                    n_hat_fwd[session_indices] = np.maximum(2, 1 + missed_fwd_sess)
+                    sess_n_param = 1 + r_offset
+                    missed_fwd_sess = self.rng.negative_binomial(n=sess_n_param, p=p, size=int(session_indices.sum()))
+                    n_hat_fwd[session_indices] = np.maximum(2, np.maximum(1, k_fwd[session_indices]) + missed_fwd_sess)
+                    u_fwd[session_indices] = n_hat_fwd[session_indices] - k_fwd[session_indices]
 
                     # Plausible backward response packets
                     bwd_ratio = self.rng.uniform(0.3, 0.8, size=int(session_indices.sum()))
                     n_hat_bwd[session_indices] = np.maximum(1, (n_hat_fwd[session_indices] * bwd_ratio).astype(np.int64))
+                    u_bwd[session_indices] = np.maximum(0, n_hat_bwd[session_indices] - k_bwd[session_indices])
 
             if fwd_col:
                 df_s[fwd_col] = n_hat_fwd
-                ratio_fwd = n_hat_fwd / np.maximum(1, k_fwd)
-            else:
-                ratio_fwd = np.full(n_rows, 1.0 / p)
-
             if bwd_col:
                 df_s[bwd_col] = n_hat_bwd
-                ratio_bwd = np.where(k_bwd > 0, n_hat_bwd / np.maximum(1, k_bwd), 1.0 / p)
-            else:
-                ratio_bwd = np.full(n_rows, 1.0 / p)
 
             n_hat_tot = n_hat_fwd + n_hat_bwd
 
-            # 2. Byte Volume Reconstruction (Compound Gamma Scale)
+            # 2. Compound Gamma Volume Reconstruction
+            # For unobserved packets U, added volume Delta_V ~ Gamma(U * alpha, scale)
+            # This follows from the reproductive property of Gamma distributions for i.i.d. packet lengths.
+            u_fwd_pos = u_fwd > 0
+            delta_bytes_fwd = np.zeros(n_rows, dtype=np.float64)
+            if u_fwd_pos.any():
+                shapes_fwd = np.maximum(0.1, u_fwd[u_fwd_pos] * self.fwd_pkt_gamma_shape_)
+                delta_bytes_fwd[u_fwd_pos] = self.rng.gamma(
+                    shape=shapes_fwd,
+                    scale=self.fwd_pkt_gamma_scale_,
+                )
+
+            u_bwd_pos = u_bwd > 0
+            delta_bytes_bwd = np.zeros(n_rows, dtype=np.float64)
+            if u_bwd_pos.any():
+                shapes_bwd = np.maximum(0.1, u_bwd[u_bwd_pos] * self.bwd_pkt_gamma_shape_)
+                delta_bytes_bwd[u_bwd_pos] = self.rng.gamma(
+                    shape=shapes_bwd,
+                    scale=self.bwd_pkt_gamma_scale_,
+                )
+
+            # Apply volume updates strictly to additive volume features (excluding window sizes)
             for col in df_s.columns:
                 col_l = col.lower()
-                if "byte" in col_l or "header_len" in col_l or "subflow" in col_l:
+                # STRICT check: Never scale TCP initial window sizes (init_win_bytes_fwd/bwd)
+                if "init_win" in col_l or "win_bytes" in col_l:
+                    continue
+
+                if col in ADDITIVE_BYTE_FEATURES or ("subflow" in col_l and "bytes" in col_l):
                     if "fwd" in col_l:
-                        noise = self.rng.gamma(shape=10.0, scale=0.1, size=n_rows)
-                        df_s[col] = np.maximum(0.0, df_s[col].values * ratio_fwd * noise)
+                        df_s[col] = np.maximum(0.0, df_s[col].values + delta_bytes_fwd)
                     elif "bwd" in col_l:
-                        noise = self.rng.gamma(shape=10.0, scale=0.1, size=n_rows)
-                        df_s[col] = np.maximum(0.0, df_s[col].values * ratio_bwd * noise)
-                    else:
-                        overall_ratio = (ratio_fwd + ratio_bwd) / 2.0
-                        df_s[col] = np.maximum(0.0, df_s[col].values * overall_ratio)
+                        df_s[col] = np.maximum(0.0, df_s[col].values + delta_bytes_bwd)
+                elif "header_len" in col_l:
+                    if "fwd" in col_l:
+                        df_s[col] = np.maximum(20.0, n_hat_fwd * 20.0)
+                    elif "bwd" in col_l:
+                        df_s[col] = np.maximum(0.0, n_hat_bwd * 20.0)
 
             # 3. Flow Duration Reconstruction
             if "flow_duration" in df_s.columns:
@@ -269,8 +369,10 @@ class SamplingDistortionUncertaintyModel:
                     df_s.loc[sess_mask, "pkt_len_max"] = 1460.0
                 probe_mask = z_sparse & sparse_mask
                 if probe_mask.any():
-                    df_s.loc[probe_mask, "pkt_len_max"] = np.clip(df_s.loc[probe_mask, "fwd_pkt_len_mean"].values, 40.0, 100.0)
+                    mean_val = df_s.loc[probe_mask, "fwd_pkt_len_mean"].values if "fwd_pkt_len_mean" in df_s.columns else 64.0
+                    df_s.loc[probe_mask, "pkt_len_max"] = np.clip(mean_val, 40.0, 100.0)
 
             reconstructed_dfs.append(df_s)
 
         return reconstructed_dfs
+

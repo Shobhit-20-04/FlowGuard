@@ -13,6 +13,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 
+# Enable IterativeImputer in scikit-learn
+from sklearn.experimental import enable_iterative_imputer  # noqa: F401
+from sklearn.impute import IterativeImputer
+from sklearn.linear_model import BayesianRidge
+
 from flowguard.evaluation.metrics import compute_classification_metrics, compute_selective_metrics
 from flowguard.models.base_classifier import BaseIntrusionClassifier
 from flowguard.sampling.simulator import PacketSamplingSimulator
@@ -38,7 +43,7 @@ class ObliviousBaseline:
 
 class ImputationBaseline:
     """
-    Baseline 2 (B2): Feature Imputation Model
+    Baseline 2 (B2): Deterministic Feature Rescaling Model
     Scales observed packet counts, byte volumes, and temporal moments deterministically
     by 1/p (the classical point-estimate imputation in network flow literature):
       N_hat = k / p
@@ -61,9 +66,12 @@ class ImputationBaseline:
         df_imputed = X_degraded.copy()
         scale = 1.0 / p
 
-        # 1. Rescale packet counts
+        # 1. Rescale packet counts and byte volumes (STRICTLY excluding TCP window sizes)
         for col in df_imputed.columns:
             col_l = col.lower()
+            if "init_win" in col_l or "win_bytes" in col_l:
+                continue
+
             if "packet" in col_l and ("total" in col_l or "subflow" in col_l):
                 df_imputed[col] = df_imputed[col].values * scale
             elif "byte" in col_l or "header_len" in col_l:
@@ -86,6 +94,69 @@ class ImputationBaseline:
                 df_imputed["flow_bytes_per_s"] = (fwd_b + bwd_b) / dur_sec
 
         return df_imputed
+
+    def predict(self, X_degraded: pd.DataFrame, sampling_rate: float) -> np.ndarray:
+        probs = self.predict_proba(X_degraded, sampling_rate=sampling_rate)
+        return (probs >= self.threshold).astype(np.int32)
+
+    def predict_proba(self, X_degraded: pd.DataFrame, sampling_rate: float) -> np.ndarray:
+        X_imp = self.impute(X_degraded, sampling_rate=sampling_rate)
+        return self.base_model.predict_proba(X_imp)
+
+
+# Semantic alias
+DeterministicRescalingBaseline = ImputationBaseline
+
+
+class MICEImputationBaseline:
+    """
+    Multivariate Imputation by Chained Equations (MICE) Baseline.
+    Fits an IterativeImputer on training flows to learn joint conditional feature distributions,
+    and imputes features whose observation is severely degraded or zeroed by sampling.
+    """
+    def __init__(
+        self,
+        base_model: BaseIntrusionClassifier,
+        threshold: float = 0.5,
+        max_iter: int = 5,
+        random_state: int = 42,
+    ):
+        self.base_model = base_model
+        self.threshold = threshold
+        self.max_iter = max_iter
+        self.random_state = random_state
+        self.imputer: Optional[IterativeImputer] = None
+        self.feature_names_: List[str] = []
+
+    def fit(self, X_train: pd.DataFrame) -> "MICEImputationBaseline":
+        self.feature_names_ = X_train.columns.tolist()
+        self.imputer = IterativeImputer(
+            estimator=BayesianRidge(),
+            max_iter=self.max_iter,
+            random_state=self.random_state,
+            sample_posterior=False,
+            initial_strategy="median",
+        )
+        self.imputer.fit(X_train.values)
+        return self
+
+    def impute(self, X_degraded: pd.DataFrame, sampling_rate: float) -> pd.DataFrame:
+        if self.imputer is None:
+            raise RuntimeError("MICEImputationBaseline must be fitted before impute()!")
+        p = float(np.clip(sampling_rate, 1e-4, 1.0))
+        if p >= 1.0:
+            return X_degraded.copy()
+
+        df_temp = X_degraded.copy()
+        # Mark severely decimated zero counts as NaN for MICE imputation
+        for col in ["total_bwd_packets", "total_bwd_bytes"]:
+            if col in df_temp.columns:
+                zero_mask = df_temp[col] == 0
+                if zero_mask.any():
+                    df_temp.loc[zero_mask, col] = np.nan
+
+        imputed_mat = self.imputer.transform(df_temp.values)
+        return pd.DataFrame(imputed_mat, columns=self.feature_names_, index=X_degraded.index)
 
     def predict(self, X_degraded: pd.DataFrame, sampling_rate: float) -> np.ndarray:
         probs = self.predict_proba(X_degraded, sampling_rate=sampling_rate)
@@ -178,12 +249,17 @@ class SamplingAugmentedBaseline:
         return self.model.predict_proba(X_degraded)
 
 
-class DeepEnsembleUncertaintyBaseline:
+class TreeEnsembleUncertaintyBaseline:
     """
-    Baseline 4 (B4): Deep Ensemble / Multi-Model Uncertainty
-    Trains an ensemble of K independently seeded models on the training data.
-    At inference time, computes predictive mean p_bar and epistemic variance sigma_ens^2.
-    Applies selective rejection when model predictive variance exceeds a rejection threshold.
+    Baseline 4 (B4): Tree Ensemble Multi-Model Epistemic Uncertainty
+    Trains an ensemble of K diverse base models using distinct random seeds,
+    bootstrapped subsamples, and feature bagging.
+    At inference time, computes predictive mean probability p_bar and predictive
+    variance sigma_ens^2 across ensemble members.
+    Applies selective rejection when predictive variance exceeds a rejection threshold.
+
+    Note: In deep learning literature, this corresponds to Deep Ensembles (Lakshminarayanan et al., 2017).
+    For tabular gradient-boosted trees / forests, it evaluates parameter diversity variance.
     """
     def __init__(
         self,
@@ -201,7 +277,7 @@ class DeepEnsembleUncertaintyBaseline:
         self.models: List[BaseIntrusionClassifier] = []
         self.is_fitted: bool = False
 
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> "DeepEnsembleUncertaintyBaseline":
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "TreeEnsembleUncertaintyBaseline":
         """
         Trains K diverse models using distinct random seeds and feature bagging.
         """
@@ -250,3 +326,7 @@ class DeepEnsembleUncertaintyBaseline:
         accepted_predictions = np.where(rejected_mask, -1, (p_mean >= self.threshold).astype(int))
 
         return p_mean, p_var, decisions, accepted_predictions
+
+
+# Backward-compatible alias
+DeepEnsembleUncertaintyBaseline = TreeEnsembleUncertaintyBaseline

@@ -35,6 +35,7 @@ class CostSensitiveThresholdCalibrator:
 
         # Calibrated parameters
         self.is_fitted: bool = False
+        self.constraint_satisfied_: bool = False
         self.optimal_tau_safe_: float = 0.20
         self.optimal_tau_attack_: float = 0.80
         self.optimal_sigma_thresh_: float = 0.05
@@ -73,10 +74,15 @@ class CostSensitiveThresholdCalibrator:
         tau_attack_candidates = np.linspace(0.55, 0.95, self.grid_steps)
         var_thresh_candidates = [0.02, 0.05, 0.10, 0.20]
 
-        best_cost = float("inf")
-        best_tau_safe = 0.20
-        best_tau_attack = 0.80
-        best_var = 0.05
+        best_feasible_cost = float("inf")
+        best_feasible_params = (0.20, 0.80, 0.05)
+        feasible_found = False
+
+        # Infeasible fallback: configuration with maximum coverage
+        best_fallback_cost = float("inf")
+        best_fallback_params = (0.20, 0.80, 0.05)
+        max_fallback_coverage = -1.0
+
         history = []
 
         is_attack_true = (y_cal == 1)
@@ -103,16 +109,14 @@ class CostSensitiveThresholdCalibrator:
 
                     coverage = accepted / max(1, n_samples)
 
-                    # Operational cost
+                    # Pure operational cost
                     cost = (
                         (self.cost_fn * fn)
                         + (self.cost_fp * fp)
                         + (self.cost_inv * inv)
                     ) / max(1, n_samples)
 
-                    # Penalize constraint violation (coverage < min_coverage)
-                    if coverage < self.min_coverage:
-                        cost += (self.min_coverage - coverage) * 10.0
+                    is_feasible = (coverage >= self.min_coverage)
 
                     history.append({
                         "tau_safe": float(t_safe),
@@ -120,21 +124,38 @@ class CostSensitiveThresholdCalibrator:
                         "sigma_thresh": float(v_thresh),
                         "cost": float(cost),
                         "coverage": float(coverage),
+                        "is_feasible": is_feasible,
                         "false_negatives": fn,
                         "false_positives": fp,
                         "investigated": inv,
                     })
 
-                    if cost < best_cost:
-                        best_cost = cost
-                        best_tau_safe = float(t_safe)
-                        best_tau_attack = float(t_attack)
-                        best_var = float(v_thresh)
+                    if is_feasible:
+                        if cost < best_feasible_cost:
+                            best_feasible_cost = cost
+                            best_feasible_params = (float(t_safe), float(t_attack), float(v_thresh))
+                            feasible_found = True
+                    else:
+                        # Fallback heuristic: maximize coverage, break ties by operational cost
+                        if coverage > max_fallback_coverage or (np.isclose(coverage, max_fallback_coverage) and cost < best_fallback_cost):
+                            max_fallback_coverage = coverage
+                            best_fallback_cost = cost
+                            best_fallback_params = (float(t_safe), float(t_attack), float(v_thresh))
 
-        self.optimal_tau_safe_ = best_tau_safe
-        self.optimal_tau_attack_ = best_tau_attack
-        self.optimal_sigma_thresh_ = best_var
-        self.best_cost_ = best_cost
+        if feasible_found:
+            self.optimal_tau_safe_, self.optimal_tau_attack_, self.optimal_sigma_thresh_ = best_feasible_params
+            self.best_cost_ = best_feasible_cost
+            self.constraint_satisfied_ = True
+        else:
+            self.optimal_tau_safe_, self.optimal_tau_attack_, self.optimal_sigma_thresh_ = best_fallback_params
+            self.best_cost_ = best_fallback_cost
+            self.constraint_satisfied_ = False
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Calibrator: min_coverage constraint ({self.min_coverage:.2f}) could not be satisfied. "
+                f"Selected maximum achievable coverage fallback ({max_fallback_coverage:.2f})."
+            )
+
         self.calibration_history_ = history
         self.is_fitted = True
 

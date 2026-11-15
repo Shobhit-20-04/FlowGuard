@@ -102,6 +102,10 @@ class SyntheticFlowGenerator:
             win_fwd = int(self.rng.choice(window_sizes))
             win_bwd = int(self.rng.choice(window_sizes)) if bwd_pkts > 0 else 0
 
+            # Active/Idle statistical realism: identical generative logic for benign and attack
+            active_mean = duration_us * 0.7 if duration_us > 10_000 else duration_us
+            active_std = float(active_mean * self.rng.uniform(0.05, 0.20)) if tot_pkts > 10 and duration_us > 50_000 else 0.0
+
             rows.append({
                 "Flow Duration": duration_us,
                 "Total Fwd Packets": fwd_pkts,
@@ -165,10 +169,10 @@ class SyntheticFlowGenerator:
                 "Init_Win_bytes_backward": win_bwd,
                 "act_data_pkt_fwd": max(0, fwd_pkts - 1),
                 "min_seg_size_forward": 20,
-                "Active Mean": duration_us * 0.7 if duration_us > 0 else 0.0,
-                "Active Std": 500.0 if duration_us > 0 else 0.0,
-                "Active Max": duration_us * 0.7 if duration_us > 0 else 0.0,
-                "Active Min": duration_us * 0.7 if duration_us > 0 else 0.0,
+                "Active Mean": active_mean,
+                "Active Std": active_std,
+                "Active Max": active_mean + active_std,
+                "Active Min": max(0.0, active_mean - active_std),
                 "Idle Mean": 0.0,
                 "Idle Std": 0.0,
                 "Idle Max": 0.0,
@@ -238,6 +242,9 @@ class SyntheticFlowGenerator:
             win_fwd = int(self.rng.choice(window_sizes))
             win_bwd = int(self.rng.choice(window_sizes)) if bwd_pkts > 0 else 0
 
+            active_mean = duration_us * 0.7 if duration_us > 10_000 else duration_us
+            active_std = float(active_mean * self.rng.uniform(0.05, 0.20)) if tot_pkts > 10 and duration_us > 50_000 else 0.0
+
             rows.append({
                 "Flow Duration": duration_us,
                 "Total Fwd Packets": fwd_pkts,
@@ -301,10 +308,10 @@ class SyntheticFlowGenerator:
                 "Init_Win_bytes_backward": win_bwd,
                 "act_data_pkt_fwd": max(0, fwd_pkts - 1),
                 "min_seg_size_forward": 20,
-                "Active Mean": duration_us * 0.7 if duration_us > 0 else 0.0,
-                "Active Std": 0.0,
-                "Active Max": duration_us * 0.7 if duration_us > 0 else 0.0,
-                "Active Min": duration_us * 0.7 if duration_us > 0 else 0.0,
+                "Active Mean": active_mean,
+                "Active Std": active_std,
+                "Active Max": active_mean + active_std,
+                "Active Min": max(0.0, active_mean - active_std),
                 "Idle Mean": 0.0,
                 "Idle Std": 0.0,
                 "Idle Max": 0.0,

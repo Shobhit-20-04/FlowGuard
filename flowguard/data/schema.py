@@ -149,6 +149,17 @@ GROUP_A_FEATURES: List[str] = [
     "act_data_pkt_fwd",
 ]
 
+# Strict set of additive byte volume and header length features
+# (Strictly distinguishes volume features from TCP window sizes init_win_bytes_fwd/bwd)
+ADDITIVE_BYTE_FEATURES: Set[str] = {
+    "total_fwd_bytes",
+    "total_bwd_bytes",
+    "subflow_fwd_bytes",
+    "subflow_bwd_bytes",
+    "fwd_header_len",
+    "bwd_header_len",
+}
+
 # Group B Features (Temporal & Inter-Arrival Time moments)
 GROUP_B_FEATURES: List[str] = [
     "flow_duration",

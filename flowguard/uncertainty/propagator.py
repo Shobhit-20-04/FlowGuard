@@ -20,20 +20,22 @@ class RiskProfile:
     """
     Encapsulates the propagated risk distribution across S Monte Carlo flow reconstructions.
     """
-    risk_min: np.ndarray       # Shape (N,): Minimum risk score R_min = min_s r^(s)
-    risk_max: np.ndarray       # Shape (N,): Maximum risk score R_max = max_s r^(s)
+    risk_min: np.ndarray       # Shape (N,): Minimum sample risk score R_min = min_s r^(s)
+    risk_max: np.ndarray       # Shape (N,): Maximum sample risk score R_max = max_s r^(s)
     risk_mean: np.ndarray      # Shape (N,): Expected risk mu_R = E_s[r^(s)]
     risk_variance: np.ndarray  # Shape (N,): Risk variance sigma_R^2 = Var_s[r^(s)]
     risk_std: np.ndarray       # Shape (N,): Risk standard deviation sigma_R
-    risk_spread: np.ndarray    # Shape (N,): Interval width Delta_R = R_max - R_min
+    risk_spread: np.ndarray    # Shape (N,): Sample interval width Delta_R = R_max - R_min
     risk_median: np.ndarray    # Shape (N,): Median risk score
     raw_risk_matrix: np.ndarray  # Shape (N, S): Full Monte Carlo risk evaluations
+    risk_q05: Optional[np.ndarray] = None  # Shape (N,): 5th percentile risk (lower 90% credible bound)
+    risk_q95: Optional[np.ndarray] = None  # Shape (N,): 95th percentile risk (upper 90% credible bound)
 
-    def to_dataframe(self) -> pd.DataFrame:
+    def to_dataframe(self, include_credible_interval: bool = False) -> pd.DataFrame:
         """
         Converts summary uncertainty statistics into a pandas DataFrame.
         """
-        return pd.DataFrame({
+        data = {
             "risk_min": self.risk_min,
             "risk_max": self.risk_max,
             "risk_mean": self.risk_mean,
@@ -41,7 +43,11 @@ class RiskProfile:
             "risk_std": self.risk_std,
             "risk_spread": self.risk_spread,
             "risk_median": self.risk_median,
-        })
+        }
+        if include_credible_interval and self.risk_q05 is not None and self.risk_q95 is not None:
+            data["risk_q05"] = self.risk_q05
+            data["risk_q95"] = self.risk_q95
+        return pd.DataFrame(data)
 
 
 class UncertaintyPropagator:
@@ -115,6 +121,8 @@ class UncertaintyPropagator:
         r_std = np.sqrt(np.maximum(0.0, r_var))
         r_spread = r_max - r_min
         r_median = np.median(risk_matrix, axis=1)
+        r_q05 = np.percentile(risk_matrix, 5.0, axis=1) if S > 1 else r_min
+        r_q95 = np.percentile(risk_matrix, 95.0, axis=1) if S > 1 else r_max
 
         return RiskProfile(
             risk_min=r_min,
@@ -124,5 +132,7 @@ class UncertaintyPropagator:
             risk_std=r_std,
             risk_spread=r_spread,
             risk_median=r_median,
+            risk_q05=r_q05,
+            risk_q95=r_q95,
             raw_risk_matrix=risk_matrix,
         )

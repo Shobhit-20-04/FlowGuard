@@ -143,17 +143,32 @@ def compute_selective_metrics(
     investigation_rate = float(n_investigate / max(1, n_total))
 
     if n_accepted > 0:
-        sel_acc = float(np.mean(y_true[is_accepted] == accepted_predictions[is_accepted]))
+        y_acc = y_true[is_accepted]
+        pred_acc = accepted_predictions[is_accepted]
+        sel_acc = float(np.mean(y_acc == pred_acc))
         sel_risk = 1.0 - sel_acc
+        tp = int(np.sum((y_acc == 1) & (pred_acc == 1)))
+        fp = int(np.sum((y_acc == 0) & (pred_acc == 1)))
+        fn = int(np.sum((y_acc == 1) & (pred_acc == 0)))
+        tn = int(np.sum((y_acc == 0) & (pred_acc == 0)))
+        prec = float(tp / max(1, tp + fp)) if (tp + fp) > 0 else 0.0
+        rec = float(tp / max(1, tp + fn)) if (tp + fn) > 0 else 0.0
+        f1 = float(2.0 * prec * rec / max(1e-9, prec + rec)) if (prec + rec) > 0 else 0.0
     else:
         sel_acc = 0.0
         sel_risk = 0.0
+        prec = 0.0
+        rec = 0.0
+        f1 = 0.0
 
     return {
         "coverage": coverage,
         "investigation_rate": investigation_rate,
         "selective_accuracy": sel_acc,
         "selective_risk": sel_risk,
+        "selective_precision": prec,
+        "selective_recall": rec,
+        "selective_f1_score": f1,
         "accepted_count": int(n_accepted),
         "investigated_count": int(n_investigate),
         "total_samples": int(n_total),
