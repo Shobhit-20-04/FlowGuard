@@ -1,7 +1,21 @@
 # FlowGuard: Git Ignore Rules
 
-# Private research-paper collection & literature tracking — NEVER commit to GitHub
+# Private Research-Paper Collection & Literature Tracking
 /paper/
+
+# Local Research Archives & Historical Snapshots (Local-Only)
+research_archive/
+archive_management/
+reproducibility/
+research_data/
+research_results/
+
+# Internal Audit Reports & Detailed Research Artifacts (Local-Only)
+docs/internal/
+docs/architecture/
+docs/mathematics/
+docs/methodology/
+docs/research/
 
 # Large Datasets & Processed Flows
 data/raw/
@@ -14,10 +28,18 @@ data/processed/
 experiments/models/
 experiments/results/
 experiments/figures/
+experiments/results_corrected/
+experiments/figures_corrected/
+scratch/
 *.joblib
 *.pkl
 *.pt
 *.pth
+*.zip
+
+# Presentations & Documents
+*.pptx
+*.pdf
 
 # Python
 __pycache__/
