@@ -10,9 +10,17 @@ Base classifiers (LightGBM, Random Forest, XGBoost) and comparative baselines:
 """
 
 from flowguard.models.base_classifier import BaseIntrusionClassifier
-from flowguard.models.baselines import ObliviousBaseline
+from flowguard.models.baselines import (
+    DeepEnsembleUncertaintyBaseline,
+    ImputationBaseline,
+    ObliviousBaseline,
+    SamplingAugmentedBaseline,
+)
 
 __all__ = [
     "BaseIntrusionClassifier",
     "ObliviousBaseline",
+    "ImputationBaseline",
+    "SamplingAugmentedBaseline",
+    "DeepEnsembleUncertaintyBaseline",
 ]
