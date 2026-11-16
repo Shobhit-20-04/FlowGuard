@@ -3,7 +3,8 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Framework](https://img.shields.io/badge/Framework-SAFE--3WD-success.svg)](docs/ARCHITECTURE.md)
-[![Tests](https://img.shields.io/badge/Tests-37%20Passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-48%20Passed-brightgreen.svg)](tests/)
+[![CLI](https://img.shields.io/badge/CLI-flowguard-blue.svg)](flowguard/cli.py)
 
 **FlowGuard** is an open-source, reproducible research framework for **Sampling-Aware Network Intrusion Detection Systems (NIDS)** under high-speed packet decimation (e.g., 1-in-10 to 1-in-100 sampling rates) and burst packet loss.
 
@@ -47,6 +48,38 @@ Evaluated across 5 random seeds (`[42, 123, 456, 789, 101112]`) across 7 samplin
 | **B4: Tree Ensemble** | $p = 0.01$ (1:100) | $100.00 \pm 0.00$ | $0.00 \pm 0.00$ | $100.00 \pm 0.00$ | $90.30 \pm 0.39$ | $0.6776 \pm 0.0048$ |
 | **FlowGuard (Proposed)** | $p = 0.01$ (1:100) | **$0.00 \pm 0.00$** | **$100.00 \pm 0.00$** | **$80.00 \pm 0.00$** | **$0.00 \pm 0.00$** | **$0.1460 \pm 0.0006$** |
 
+> [!NOTE]
+> **Scientific Interpretation of Benchmark Results:**
+> - **Oblivious Collapse Mitigation:** FlowGuard suppresses false alarms from 90.30% down to 0.00%, achieving a **$4.67\times$ cost reduction** relative to naive deployment (B1).
+> - **Direct Detection vs. Investigation:** At severe sampling rates ($p \le 0.10$), high epistemic uncertainty appropriately routes ambiguous flows to Region 3 (Investigation), avoiding overconfident misclassifications. Post-triage detection reflects assumed secondary inspection efficacy ($\rho_{\text{sec}}^{\text{TPR}} = 0.80$), strictly distinguished from direct automated detection.
+> - **Comparison to Sampling-Augmented Baseline (B3):** While B3 achieves low cost when trained specifically on static sampling rates, FlowGuard's core scientific contribution lies in **non-stationary sampling rate drift** and dynamic rate adaptation ($p_{\text{deploy}} \neq p_{\text{train}}$), where FlowGuard conditions dynamically on $p$ at runtime without requiring model retraining.
+
+---
+
+## Unified Command-Line Interface (CLI)
+
+FlowGuard includes a unified CLI for end-to-end execution:
+
+```bash
+# Validate processed dataset splits and schema alignment
+python -m flowguard.cli data validate
+
+# Prepare and partition benchmark datasets
+python -m flowguard.cli data prepare --samples 50000 --seed 42
+
+# Train regularized base classifier
+python -m flowguard.cli train --model lightgbm
+
+# Calibrate SAFE-3WD operational decision thresholds
+python -m flowguard.cli calibrate --sampling-rate 0.10 --policy quantile
+
+# Evaluate pipeline under sampling distortion
+python -m flowguard.cli evaluate --sampling-rate 0.10 --subset 1000
+
+# Run complete comparative baselines benchmark
+python -m flowguard.cli benchmark
+```
+
 ---
 
 ## Installation & Quickstart
@@ -70,7 +103,7 @@ pip install -e .
 ```
 
 ### Running Tests
-Execute the comprehensive test suite (37 unit tests covering all components):
+Execute the comprehensive test suite (48 unit tests covering all components):
 ```bash
 pytest -v
 ```
@@ -99,6 +132,7 @@ python experiments/06_run_corrected_experiments.py
 ```text
 FlowGuard/
 ├── flowguard/             # Core Python package
+│   ├── cli.py             # Unified CLI (validate, prepare, train, calibrate, evaluate)
 │   ├── data/              # Feature taxonomy, preprocessors, loaders, dataset ingestion
 │   ├── sampling/          # Ingress packet sampling & Gilbert-Elliott burst loss models
 │   ├── uncertainty/       # SDUM Bayesian inversion & Monte Carlo risk propagator
@@ -106,7 +140,7 @@ FlowGuard/
 │   ├── models/            # Base classifiers (LightGBM, XGBoost) & baselines (B1-B4, MICE)
 │   └── evaluation/        # Cost-sensitive metrics, disaggregated rates, and diagnostics
 ├── experiments/           # Benchmark and evaluation scripts (00 to 06)
-├── tests/                 # Unit and regression test suite (37 tests)
+├── tests/                 # Unit and regression test suite (48 tests)
 ├── configs/               # System configuration (default_config.yaml)
 ├── docs/                  # Architecture, methodology, and reproducibility documentation
 ├── requirements.txt       # Core project dependencies

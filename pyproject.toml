@@ -40,6 +40,9 @@ dev = [
     "pytest-cov>=4.1.0"
 ]
 
+[project.scripts]
+flowguard = "flowguard.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["flowguard*"]
@@ -52,5 +55,6 @@ norecursedirs = [
     "archive_management",
     "docs",
     "paper",
-    "data"
+    "data",
+    "research"
 ]

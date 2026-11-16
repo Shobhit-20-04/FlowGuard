@@ -14,6 +14,7 @@ import argparse
 import os
 import sys
 import time
+import pandas as pd
 
 # Ensure project root is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -35,7 +36,12 @@ def main():
 
     start_time = time.time()
 
-    if args.input and os.path.exists(args.input):
+    if args.input:
+        if not os.path.exists(args.input):
+            raise FileNotFoundError(
+                f"Error: Specified dataset input path does not exist: {os.path.abspath(args.input)}. "
+                "FlowGuard refuses silent fallback to synthetic data when an explicit path is provided."
+            )
         print(f"\n[1/3] Loading raw dataset from: {args.input}")
         if args.input.endswith(".parquet"):
             raw_df = pd.read_parquet(args.input)

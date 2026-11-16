@@ -29,15 +29,20 @@ class FlowDataLoader:
         calibration_ratio: float = 0.15,
         test_ratio: float = 0.20,
         random_seed: int = 42,
+        split_strategy: str = "stratified",
     ):
         assert abs((train_ratio + calibration_ratio + test_ratio) - 1.0) < 1e-5, (
             "Split ratios must sum to 1.0!"
         )
+        if split_strategy not in ["stratified", "chronological"]:
+            raise ValueError(f"Unknown split_strategy '{split_strategy}'. Must be 'stratified' or 'chronological'.")
+
         self.processed_dir = processed_dir
         self.train_ratio = train_ratio
         self.calibration_ratio = calibration_ratio
         self.test_ratio = test_ratio
         self.random_seed = random_seed
+        self.split_strategy = split_strategy
         self.preprocessor = FlowDataPreprocessor()
 
     def process_and_partition(
@@ -52,30 +57,54 @@ class FlowDataLoader:
     ]:
         """
         Executes a leak-free train/calibration/test pipeline:
-        1. First split out the Test Set (20%) using stratified sampling.
-        2. From the remaining 80%, split into Train (65% of total) and Calibration (15% of total).
-        3. Fit preprocessor strictly on Train, then transform Train, Calibration, and Test.
-        4. Optionally saves to Parquet in processed_dir.
+        1. Split according to selected strategy ('stratified' or 'chronological').
+        2. Fit preprocessor strictly on Train, then transform Train, Calibration, and Test.
+        3. Optionally saves to Parquet in processed_dir.
         """
-        # Step 1: Initial split to isolate held-out Test set
-        test_fraction = self.test_ratio
-        df_train_calib, df_test = train_test_split(
-            df,
-            test_size=test_fraction,
-            random_state=self.random_seed,
-            stratify=df["Label"] if "Label" in df.columns else (df["label"] if "label" in df.columns else None),
-        )
+        n_total = len(df)
 
-        # Step 2: Split remaining data into Train and Calibration
-        calib_fraction_of_remainder = self.calibration_ratio / (self.train_ratio + self.calibration_ratio)
-        df_train, df_calib = train_test_split(
-            df_train_calib,
-            test_size=calib_fraction_of_remainder,
-            random_state=self.random_seed,
-            stratify=df_train_calib["Label"] if "Label" in df_train_calib.columns else (
-                df_train_calib["label"] if "label" in df_train_calib.columns else None
-            ),
-        )
+        if self.split_strategy == "chronological":
+            # Identify timestamp column if available and sort chronologically
+            df_sorted = df.copy()
+            ts_col = None
+            for col in ["Timestamp", "timestamp", "time", "date"]:
+                if col in df_sorted.columns:
+                    ts_col = col
+                    break
+            if ts_col:
+                try:
+                    df_sorted[ts_col] = pd.to_datetime(df_sorted[ts_col])
+                    df_sorted = df_sorted.sort_values(by=ts_col)
+                except Exception:
+                    df_sorted = df_sorted.sort_values(by=ts_col)
+
+            # Sequential split boundaries
+            n_train = int(n_total * self.train_ratio)
+            n_calib = int(n_total * self.calibration_ratio)
+
+            df_train = df_sorted.iloc[:n_train].copy()
+            df_calib = df_sorted.iloc[n_train:n_train + n_calib].copy()
+            df_test = df_sorted.iloc[n_train + n_calib:].copy()
+        else:
+            # Step 1: Initial split to isolate held-out Test set via stratified sampling
+            test_fraction = self.test_ratio
+            df_train_calib, df_test = train_test_split(
+                df,
+                test_size=test_fraction,
+                random_state=self.random_seed,
+                stratify=df["Label"] if "Label" in df.columns else (df["label"] if "label" in df.columns else None),
+            )
+
+            # Step 2: Split remaining data into Train and Calibration
+            calib_fraction_of_remainder = self.calibration_ratio / (self.train_ratio + self.calibration_ratio)
+            df_train, df_calib = train_test_split(
+                df_train_calib,
+                test_size=calib_fraction_of_remainder,
+                random_state=self.random_seed,
+                stratify=df_train_calib["Label"] if "Label" in df_train_calib.columns else (
+                    df_train_calib["label"] if "label" in df_train_calib.columns else None
+                ),
+            )
 
         # Step 3: Fit preprocessor strictly on Train
         self.preprocessor.fit(df_train)

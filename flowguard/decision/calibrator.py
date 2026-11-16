@@ -26,12 +26,16 @@ class CostSensitiveThresholdCalibrator:
         cost_inv: float = 0.15,
         min_coverage: float = 0.40,
         grid_steps: int = 25,
+        policy: str = "quantile",
+        k_sigma: float = 1.0,
     ):
         self.cost_fn = float(cost_fn)
         self.cost_fp = float(cost_fp)
         self.cost_inv = float(cost_inv)
         self.min_coverage = float(min_coverage)
         self.grid_steps = int(grid_steps)
+        self.policy = policy
+        self.k_sigma = float(k_sigma)
 
         # Calibrated parameters
         self.is_fitted: bool = False
@@ -67,7 +71,9 @@ class CostSensitiveThresholdCalibrator:
 
         r_min = calibration_risk_profile.risk_min
         r_max = calibration_risk_profile.risk_max
+        r_mean = calibration_risk_profile.risk_mean
         r_var = calibration_risk_profile.risk_variance
+        sigma_r = np.sqrt(np.maximum(0.0, r_var))
 
         # Search grid
         tau_safe_candidates = np.linspace(0.05, 0.45, self.grid_steps)
@@ -92,13 +98,20 @@ class CostSensitiveThresholdCalibrator:
             var_ok = (r_var <= v_thresh)
 
             for t_safe in tau_safe_candidates:
-                benign_mask = (r_max < t_safe) & var_ok
+                if self.policy == "quantile":
+                    benign_mask = (r_max < t_safe) & var_ok
+                else:
+                    benign_mask = (r_mean + self.k_sigma * sigma_r < t_safe) & var_ok
 
                 for t_attack in tau_attack_candidates:
                     if t_attack < t_safe:
                         continue
 
-                    attack_mask = (r_min > t_attack) & var_ok
+                    if self.policy == "quantile":
+                        attack_mask = (r_min > t_attack) & var_ok
+                    else:
+                        attack_mask = (r_mean - self.k_sigma * sigma_r > t_attack) & var_ok
+
                     inv_mask = ~(benign_mask | attack_mask)
 
                     # Errors & Volumes
@@ -172,4 +185,6 @@ class CostSensitiveThresholdCalibrator:
             tau_safe=self.optimal_tau_safe_,
             tau_attack=self.optimal_tau_attack_,
             max_acceptable_variance=self.optimal_sigma_thresh_,
+            policy=self.policy,
+            k_sigma=self.k_sigma,
         )

@@ -24,6 +24,8 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
+from sklearn.model_selection import train_test_split
+
 # Ensure project root is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -111,11 +113,21 @@ def main():
     propagator = UncertaintyPropagator(base_classifier=base_clf, sdum=sdum, n_mc_samples=args.mc_samples)
     simulator = PacketSamplingSimulator(seed=args.seed)
 
-    # Evaluate on a stratified subset of test flows for high-speed benchmark execution
+    # Evaluate on a genuinely stratified subset of test flows for reproducible benchmark execution
     n_eval = min(args.test_subset, len(X_test))
-    eval_indices = np.random.default_rng(args.seed).choice(len(X_test), size=n_eval, replace=False)
-    X_eval = X_test.iloc[eval_indices].copy()
-    y_eval = y_test.iloc[eval_indices].copy()
+    if n_eval < len(X_test):
+        X_eval, _, y_eval, _ = train_test_split(
+            X_test,
+            y_test,
+            train_size=n_eval,
+            stratify=y_test,
+            random_state=args.seed,
+        )
+    else:
+        X_eval = X_test.copy()
+        y_eval = y_test.copy()
+
+    print(f"      Selected {len(X_eval):,} stratified test flows (Attacks: {y_eval.sum():,}, {y_eval.mean()*100:.2f}%)")
 
     sampling_rates = [1.0, 0.50, 0.20, 0.10, 0.05, 0.02, 0.01]
     benchmark_records: List[Dict[str, Any]] = []

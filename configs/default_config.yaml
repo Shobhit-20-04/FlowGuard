@@ -5,7 +5,7 @@
 
 project:
   name: "FlowGuard"
-  version: "1.0.0"
+  version: "0.2.0"
   random_seed: 42
   deterministic: true
   num_workers: 4
@@ -51,12 +51,12 @@ sampling_degradation:
 
 uncertainty_model:
   num_monte_carlo_draws: 30 # S = 30 plausible true flow reconstructions per sampled flow
-  distribution_type: "negative_binomial" # For packet counts; gamma/lognormal for volumes & durations
-  preserve_correlation: true # Cholesky / Copula correlation preservation across features
-  alpha_confidence: 0.95 # Coverage level for credible intervals
+  distribution_type: "negative_binomial" # For packet counts; compound gamma for volumes & durations
+  preserve_correlation: true # Gaussian Copula correlation preservation across features
+  alpha_confidence: 0.90 # Coverage level for credible intervals (matches 5th/95th percentiles)
 
 base_classifiers:
-  selected: "lightgbm" # Options: lightgbm, random_forest, mlp, xgboost
+  selected: "lightgbm" # Options: lightgbm, random_forest, xgboost
   lightgbm:
     n_estimators: 300
     learning_rate: 0.05
@@ -72,7 +72,8 @@ base_classifiers:
     random_state: 42
 
 three_way_decision_policy:
-  policy_type: "SAFE_3WD"
+  policy_type: "quantile" # Options: quantile (minimax bound), moment (mean & variance bound)
+  k_sigma: 1.0 # Moment policy multiplier for standard deviation bound
   optimization_target: "cost_sensitive_risk"
   # Calibrated on validation set
   default_tau_safe: 0.20 # R_max < tau_safe => Classify Benign
@@ -80,12 +81,14 @@ three_way_decision_policy:
   # Flows whose range overlaps [tau_safe, tau_attack] or variance > max_variance => INVESTIGATE
   max_acceptable_variance: 0.04
   investigation_cost_ratio: 0.10 # Relative operational cost of inspecting vs false negative
+  secondary_triage_tpr: 0.90 # P(detect | attack in secondary triage)
+  secondary_triage_fpr: 0.02 # P(alarm | benign in secondary triage)
 
 baselines:
   run_oblivious: true          # Standard classifier on sampled flows without correction
   run_imputation: true         # MICE / Autoencoder feature imputation
   run_data_augmented: true     # Model retrained with multi-rate sampled synthetic flows
-  run_mc_dropout: true         # Standard MC-Dropout / Deep Ensemble uncertainty without sampling model
+  run_mc_dropout: true         # Deep Tree Ensemble epistemic uncertainty baseline without sampling model
   run_flowguard: true          # Proposed SAFE-3WD mechanism
 
 evaluation_metrics:

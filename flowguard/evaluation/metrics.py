@@ -7,10 +7,12 @@ calibration metrics (ECE, Brier Score), and three-way selective decision metrics
 """
 
 from typing import Dict, List, Optional, Tuple, Union
+import logging
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
     accuracy_score,
+    auc,
     confusion_matrix,
     f1_score,
     precision_recall_curve,
@@ -18,6 +20,8 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
+
+logger = logging.getLogger(__name__)
 
 def compute_expected_calibration_error(
     y_true: np.ndarray,
@@ -107,10 +111,24 @@ def compute_classification_metrics(
 
     if y_prob is not None:
         y_pr = np.asarray(y_prob).astype(np.float64)
-        try:
-            metrics["roc_auc"] = float(roc_auc_score(y_t, y_pr))
-        except Exception:
-            metrics["roc_auc"] = 0.5
+        if len(np.unique(y_t)) > 1:
+            try:
+                metrics["roc_auc"] = float(roc_auc_score(y_t, y_pr))
+            except Exception as e:
+                logger.warning(f"ROC-AUC computation failed: {e}")
+                metrics["roc_auc"] = float("nan")
+
+            try:
+                prec_c, rec_c, _ = precision_recall_curve(y_t, y_pr)
+                metrics["pr_auc"] = float(auc(rec_c, prec_c))
+            except Exception as e:
+                logger.warning(f"PR-AUC computation failed: {e}")
+                metrics["pr_auc"] = float("nan")
+        else:
+            logger.warning("Only one class present in y_true. ROC-AUC and PR-AUC are undefined.")
+            metrics["roc_auc"] = float("nan")
+            metrics["pr_auc"] = float("nan")
+
         metrics["brier_score"] = compute_brier_score(y_t, y_pr)
         metrics["expected_calibration_error"] = compute_expected_calibration_error(y_t, y_pr)
 
@@ -131,6 +149,13 @@ def compute_selective_metrics(
     y_true = np.asarray(y_true)
     decisions = np.asarray(decisions)
     accepted_predictions = np.asarray(accepted_predictions)
+
+    # Validate decision labels
+    valid_labels = {"BENIGN", "ATTACK", "INVESTIGATE", 0, 1, 2}
+    unique_decs = set(np.unique(decisions))
+    if not unique_decs.issubset(valid_labels):
+        invalid = unique_decs - valid_labels
+        raise ValueError(f"Invalid decision labels encountered in selective metrics: {invalid}")
 
     n_total = len(y_true)
     is_investigate = (decisions == "INVESTIGATE") | (decisions == 2)

@@ -82,13 +82,20 @@ class SafeThreeWayDecisionEngine:
         tau_safe: float = 0.20,
         tau_attack: float = 0.80,
         max_acceptable_variance: float = 0.04,
+        policy: str = "quantile",
+        k_sigma: float = 1.0,
     ):
         assert 0.0 < tau_safe <= tau_attack < 1.0, (
             f"Invalid threshold bounds: tau_safe ({tau_safe}) must be <= tau_attack ({tau_attack}) in (0, 1)!"
         )
+        if policy not in ["quantile", "moment"]:
+            raise ValueError(f"Unknown decision policy '{policy}'. Must be 'quantile' or 'moment'.")
+
         self.tau_safe = float(tau_safe)
         self.tau_attack = float(tau_attack)
         self.max_acceptable_variance = float(max_acceptable_variance)
+        self.policy = policy
+        self.k_sigma = float(k_sigma)
 
     def decide(self, risk_profile: RiskProfile) -> ThreeWayDecisionResult:
         """
@@ -111,14 +118,23 @@ class SafeThreeWayDecisionEngine:
         r_spread = risk_profile.risk_spread
 
         n_rows = len(r_min)
+        var_ok = (r_var <= self.max_acceptable_variance)
 
-        # Region 1: Benign (Fast Accept)
-        # Even worst-case plausible flow reconstruction is safely below tau_safe, with low variance
-        benign_mask = (r_max < self.tau_safe) & (r_var <= self.max_acceptable_variance)
-
-        # Region 2: Attack (Immediate Block)
-        # Even least-suspicious plausible flow reconstruction is strictly above tau_attack, with low variance
-        attack_mask = (r_min > self.tau_attack) & (r_var <= self.max_acceptable_variance)
+        if self.policy == "quantile":
+            # Empirical minimax quantile policy:
+            # Region 1 (Benign / Fast Accept): R_max < tau_safe and sigma_R^2 <= max_acceptable_variance
+            # Region 2 (Attack / Immediate Block): R_min > tau_attack and sigma_R^2 <= max_acceptable_variance
+            benign_mask = (r_max < self.tau_safe) & var_ok
+            attack_mask = (r_min > self.tau_attack) & var_ok
+        elif self.policy == "moment":
+            # Moment-bounded policy:
+            # Region 1 (Benign): mu_R + k * sigma_R < tau_safe and sigma_R^2 <= max_acceptable_variance
+            # Region 2 (Attack): mu_R - k * sigma_R > tau_attack and sigma_R^2 <= max_acceptable_variance
+            sigma_r = np.sqrt(np.maximum(0.0, r_var))
+            benign_bound = r_mean + self.k_sigma * sigma_r
+            attack_bound = r_mean - self.k_sigma * sigma_r
+            benign_mask = (benign_bound < self.tau_safe) & var_ok
+            attack_mask = (attack_bound > self.tau_attack) & var_ok
 
         # Region 3: Investigate (Defer / Deep Inspection)
         # Plausible flow reconstructions intersect boundary or variance is too high
@@ -139,8 +155,12 @@ class SafeThreeWayDecisionEngine:
 
         # Confidence scores
         confidences = np.zeros(n_rows, dtype=np.float64)
-        confidences[benign_mask] = np.maximum(0.0, 1.0 - r_max[benign_mask])
-        confidences[attack_mask] = np.maximum(0.0, r_min[attack_mask])
+        if self.policy == "quantile":
+            confidences[benign_mask] = np.maximum(0.0, 1.0 - r_max[benign_mask])
+            confidences[attack_mask] = np.maximum(0.0, r_min[attack_mask])
+        else:
+            confidences[benign_mask] = np.maximum(0.0, 1.0 - (r_mean[benign_mask] + self.k_sigma * sigma_r[benign_mask]))
+            confidences[attack_mask] = np.maximum(0.0, (r_mean[attack_mask] - self.k_sigma * sigma_r[attack_mask]))
 
         return ThreeWayDecisionResult(
             decisions=decisions,
@@ -162,6 +182,8 @@ class SafeThreeWayDecisionEngine:
         cost_fp: float = 1.0,
         cost_inv: float = 0.15,
         secondary_triage_efficiency: Optional[float] = None,
+        secondary_triage_tpr: Optional[float] = None,
+        secondary_triage_fpr: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Rigorously evaluates SAFE-3WD performance, selective accuracy, coverage, and operational costs.
@@ -179,8 +201,11 @@ class SafeThreeWayDecisionEngine:
         cost_inv : float
             Cost of deep manual/sandbox inspection per investigated flow.
         secondary_triage_efficiency : Optional[float]
-            Secondary triage detection success rate rho_sec in [0, 1].
-            If None, investigated flows are strictly kept separate without assuming automated detection.
+            Legacy alias for secondary triage attack detection rate.
+        secondary_triage_tpr : Optional[float]
+            Secondary triage detection sensitivity P(detect | attack in triage).
+        secondary_triage_fpr : Optional[float]
+            Secondary triage false alarm probability P(flag | benign in triage).
         """
         y_t = np.asarray(y_true).ravel()
         res = self.decide(risk_profile)
@@ -269,10 +294,45 @@ class SafeThreeWayDecisionEngine:
             "max_acceptable_variance": self.max_acceptable_variance,
         }
 
-        if secondary_triage_efficiency is not None:
-            rho = float(np.clip(secondary_triage_efficiency, 0.0, 1.0))
-            result["secondary_triage_efficiency"] = rho
-            result["post_triage_detection_rate"] = float(direct_detection_rate + rho * attack_investigation_rate)
-            result["post_triage_fpr"] = float(direct_fpr + (1.0 - rho) * benign_investigation_rate)
+        # Secondary Triage Modeling
+        # Decouple secondary detection sensitivity (TPR) from secondary false positive rate (FPR)
+        tpr = None
+        fpr = None
+        if secondary_triage_tpr is not None:
+            tpr = float(np.clip(secondary_triage_tpr, 0.0, 1.0))
+        elif secondary_triage_efficiency is not None:
+            tpr = float(np.clip(secondary_triage_efficiency, 0.0, 1.0))
+
+        if secondary_triage_fpr is not None:
+            fpr = float(np.clip(secondary_triage_fpr, 0.0, 1.0))
+        elif secondary_triage_efficiency is not None:
+            # Backwards compatibility: if user only passes secondary_triage_efficiency
+            fpr = float(np.clip(1.0 - secondary_triage_efficiency, 0.0, 1.0))
+
+        if tpr is not None:
+            if fpr is None:
+                fpr = 0.02  # Standard nominal secondary inspection false alarm rate
+
+            result["secondary_triage_tpr"] = tpr
+            result["secondary_triage_fpr"] = fpr
+            result["secondary_triage_efficiency"] = tpr
+
+            post_dr = float(direct_detection_rate + tpr * attack_investigation_rate)
+            post_fpr = float(direct_fpr + fpr * benign_investigation_rate)
+
+            result["post_triage_detection_rate"] = post_dr
+            result["post_triage_fpr"] = post_fpr
+
+            # Post-triage residual false negatives and false positives
+            residual_fn = int(round((1.0 - tpr) * attack_inv_count))
+            secondary_fp = int(round(fpr * benign_inv_count))
+
+            post_triage_cost = (
+                (cost_fn * (false_negatives + residual_fn))
+                + (cost_fp * (false_positives + secondary_fp))
+                + (cost_inv * investigated_flows)
+            )
+            result["post_triage_operational_cost"] = float(post_triage_cost)
+            result["post_triage_cost_per_flow"] = float(post_triage_cost / max(1, len(y_t)))
 
         return result

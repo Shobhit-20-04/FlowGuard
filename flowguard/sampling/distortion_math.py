@@ -53,6 +53,30 @@ def sampled_iat_moments(
     var_sampled_iat = (var_tau / p) + (((1.0 - p) / (p ** 2)) * (mu_tau ** 2))
     return expected_sampled_iat, max(0.0, var_sampled_iat)
 
+def invert_sampled_iat_moments(
+    mean_sampled_iat: float,
+    std_sampled_iat: float,
+    sampling_rate: float,
+    min_std: float = 1e-4,
+) -> Tuple[float, float]:
+    """
+    Inverts the geometric-sum variance and mean formulas to estimate the original
+    pristine inter-arrival time (IAT) mean and standard deviation:
+      E[tau] = p * E[tau_tilde]
+      Var(tau) = max(min_std^2, p * Var(tau_tilde) - p * (1 - p) * (E[tau_tilde])^2)
+      std[tau] = sqrt(Var(tau))
+    """
+    p = float(np.clip(sampling_rate, 1e-5, 1.0))
+    mu_sampled = max(0.0, float(mean_sampled_iat))
+    var_sampled = max(0.0, float(std_sampled_iat) ** 2)
+
+    mu_true = p * mu_sampled
+    dispersion_term = p * (1.0 - p) * (mu_sampled ** 2)
+    var_true = max(float(min_std) ** 2, p * var_sampled - dispersion_term)
+    std_true = float(np.sqrt(var_true))
+
+    return mu_true, std_true
+
 def gilbert_elliott_parameters(loss_rate: float, burst_length: float) -> Dict[str, float]:
     """
     Derives Gilbert-Elliott 2-state Markov chain transition probabilities
