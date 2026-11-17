@@ -30,6 +30,7 @@ class FlowDataLoader:
         test_ratio: float = 0.20,
         random_seed: int = 42,
         split_strategy: str = "stratified",
+        include_quarantined_in_train: bool = False,
     ):
         assert abs((train_ratio + calibration_ratio + test_ratio) - 1.0) < 1e-5, (
             "Split ratios must sum to 1.0!"
@@ -43,7 +44,12 @@ class FlowDataLoader:
         self.test_ratio = test_ratio
         self.random_seed = random_seed
         self.split_strategy = split_strategy
+        self.include_quarantined_in_train = bool(include_quarantined_in_train)
         self.preprocessor = FlowDataPreprocessor()
+
+        # Quarantined records tracking for chronological splitting
+        self.quarantined_records_: pd.DataFrame = pd.DataFrame()
+        self.quarantined_count_: int = 0
 
     def process_and_partition(
         self,
@@ -64,27 +70,121 @@ class FlowDataLoader:
         n_total = len(df)
 
         if self.split_strategy == "chronological":
-            # Identify timestamp column if available and sort chronologically
+            # Identify timestamp column if available and sort chronologically using stable sort
             df_sorted = df.copy()
             ts_col = None
-            for col in ["Timestamp", "timestamp", "time", "date"]:
-                if col in df_sorted.columns:
+            for col in df_sorted.columns:
+                c_clean = str(col).strip().lower()
+                if c_clean in ["timestamp", "time", "date", "flow_start_time"]:
                     ts_col = col
                     break
+
             if ts_col:
-                try:
-                    df_sorted[ts_col] = pd.to_datetime(df_sorted[ts_col])
-                    df_sorted = df_sorted.sort_values(by=ts_col)
-                except Exception:
-                    df_sorted = df_sorted.sort_values(by=ts_col)
+                # Convert timestamps safely with datetime parsing
+                ts_series = pd.to_datetime(df_sorted[ts_col], errors="coerce")
+                df_sorted["_parsed_ts"] = ts_series
 
-            # Sequential split boundaries
-            n_train = int(n_total * self.train_ratio)
-            n_calib = int(n_total * self.calibration_ratio)
+                valid_mask = df_sorted["_parsed_ts"].notna()
+                df_invalid = df_sorted[~valid_mask].copy() if (~valid_mask).any() else pd.DataFrame(columns=df_sorted.columns)
+                df_valid = df_sorted[valid_mask].copy()
 
-            df_train = df_sorted.iloc[:n_train].copy()
-            df_calib = df_sorted.iloc[n_train:n_train + n_calib].copy()
-            df_test = df_sorted.iloc[n_train + n_calib:].copy()
+                if len(df_valid) == 0:
+                    logger.warning("All timestamps are invalid or unparseable. Falling back to sequential row splitting.")
+                    n_train = int(n_total * self.train_ratio)
+                    n_calib = int(n_total * self.calibration_ratio)
+                    df_train = df_sorted.iloc[:n_train].copy()
+                    df_calib = df_sorted.iloc[n_train:n_train + n_calib].copy()
+                    df_test = df_sorted.iloc[n_train + n_calib:].copy()
+                else:
+                    # Sort valid records stably by timestamp
+                    df_valid = df_valid.sort_values(by="_parsed_ts", kind="mergesort").reset_index(drop=True)
+                    n_valid = len(df_valid)
+                    unique_ts = df_valid["_parsed_ts"].unique()
+
+                    if len(unique_ts) >= 3:
+                        # Deterministic timestamp group-boundary policy:
+                        # Ensures T_train < T_calib < T_test strictly, preventing timestamp leakage.
+                        n_train_target = max(1, int(n_valid * self.train_ratio))
+                        n_calib_target = max(1, int(n_valid * self.calibration_ratio))
+
+                        # Cut 1: Train boundary timestamp T1
+                        t1_idx = min(n_train_target - 1, n_valid - 3)
+                        t1 = df_valid["_parsed_ts"].iloc[t1_idx]
+                        if t1 >= unique_ts[-2]:
+                            # Ensure at least two unique timestamps remain for calib and test
+                            t1 = unique_ts[max(0, len(unique_ts) - 3)]
+
+                        df_train_valid = df_valid[df_valid["_parsed_ts"] <= t1].copy()
+                        df_rem = df_valid[df_valid["_parsed_ts"] > t1].copy().reset_index(drop=True)
+
+                        # Cut 2: Calib boundary timestamp T2
+                        n_rem = len(df_rem)
+                        unique_rem_ts = df_rem["_parsed_ts"].unique()
+                        if len(unique_rem_ts) >= 2:
+                            t2_idx = min(max(0, n_calib_target - 1), n_rem - 2)
+                            t2 = df_rem["_parsed_ts"].iloc[t2_idx]
+                            if t2 >= unique_rem_ts[-1]:
+                                t2 = unique_rem_ts[-2]
+
+                            df_calib = df_rem[df_rem["_parsed_ts"] <= t2].copy()
+                            df_test = df_rem[df_rem["_parsed_ts"] > t2].copy()
+                        else:
+                            # Fallback if remaining unique timestamps cannot be split strictly
+                            mid = max(1, n_rem // 2)
+                            df_calib = df_rem.iloc[:mid].copy()
+                            df_test = df_rem.iloc[mid:].copy()
+
+                        # Quarantined records with invalid/missing timestamps handling:
+                        # Excluded from evaluation splits by default; included in train only if explicitly configured.
+                        self.quarantined_records_ = df_invalid
+                        self.quarantined_count_ = len(df_invalid)
+
+                        if len(df_invalid) > 0:
+                            if self.include_quarantined_in_train:
+                                logger.warning(
+                                    f"Chronological split: Merging {self.quarantined_count_} quarantined records "
+                                    f"(missing/invalid timestamps) into the training partition by explicit configuration."
+                                )
+                                df_train = pd.concat([df_train_valid, df_invalid], ignore_index=True)
+                            else:
+                                logger.info(
+                                    f"Chronological split: Quarantined {self.quarantined_count_} records with "
+                                    f"missing/invalid timestamps (excluded from training/evaluation splits)."
+                                )
+                                df_train = df_train_valid
+                        else:
+                            df_train = df_train_valid
+                    else:
+                        logger.warning(
+                            f"Chronological split: Only {len(unique_ts)} unique timestamps found. "
+                            f"Falling back to sequential row splitting across valid records."
+                        )
+                        self.quarantined_records_ = df_invalid
+                        self.quarantined_count_ = len(df_invalid)
+                        n_train = max(1, int(n_valid * self.train_ratio))
+                        n_calib = max(1, int(n_valid * self.calibration_ratio))
+                        if len(df_invalid) > 0 and self.include_quarantined_in_train:
+                            df_train = pd.concat([df_valid.iloc[:n_train], df_invalid], ignore_index=True)
+                        else:
+                            df_train = df_valid.iloc[:n_train].copy()
+                        df_calib = df_valid.iloc[n_train:n_train + n_calib].copy()
+                        df_test = df_valid.iloc[n_train + n_calib:].copy()
+
+                df_sorted = df_sorted.drop(columns=["_parsed_ts"], errors="ignore")
+                df_train = df_train.drop(columns=["_parsed_ts"], errors="ignore")
+                df_calib = df_calib.drop(columns=["_parsed_ts"], errors="ignore")
+                df_test = df_test.drop(columns=["_parsed_ts"], errors="ignore")
+            else:
+                logger.warning(
+                    "Chronological split requested, but no timestamp column ('timestamp', 'time', 'date') found. "
+                    "Proceeding with sequential row partitioning."
+                )
+                n_train = int(n_total * self.train_ratio)
+                n_calib = int(n_total * self.calibration_ratio)
+
+                df_train = df_sorted.iloc[:n_train].copy()
+                df_calib = df_sorted.iloc[n_train:n_train + n_calib].copy()
+                df_test = df_sorted.iloc[n_train + n_calib:].copy()
         else:
             # Step 1: Initial split to isolate held-out Test set via stratified sampling
             test_fraction = self.test_ratio

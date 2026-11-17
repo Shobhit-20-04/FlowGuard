@@ -124,10 +124,15 @@ def cmd_data_prepare(args: argparse.Namespace) -> int:
             return 1
         print(f"Loading raw dataset: {in_path.resolve()}")
         raw_df = pd.read_parquet(in_path) if in_path.suffix == ".parquet" else pd.read_csv(in_path)
-    else:
+    elif getattr(args, "synthetic", False):
         print(f"Generating synthetic benchmark flows ({args.samples:,} flows, seed={args.seed})...")
         gen = SyntheticFlowGenerator(seed=args.seed)
         raw_df = gen.generate_flow_batch(n_samples=args.samples, attack_ratio=0.25)
+    else:
+        print("Error: No dataset specified. Provide a raw dataset path via '--input <path>' or "
+              "explicitly opt in to synthetic benchmark flow generation via '--synthetic'.")
+        print("FlowGuard never silently generates synthetic data without explicit user request.")
+        return 1
 
     loader = FlowDataLoader(
         processed_dir=args.output_dir,
@@ -386,6 +391,7 @@ def build_parser() -> argparse.ArgumentParser:
     # data prepare
     p_dprep = data_subs.add_parser("prepare", help="Run data preprocessing and partitioning")
     p_dprep.add_argument("--input", type=str, default=None, help="Raw dataset path")
+    p_dprep.add_argument("--synthetic", action="store_true", help="Explicitly opt in to generating synthetic benchmark flows")
     p_dprep.add_argument("--samples", type=int, default=50000, help="Number of synthetic samples")
     p_dprep.add_argument("--output-dir", type=str, default="data/processed", help="Output directory")
     p_dprep.add_argument("--train-ratio", type=float, default=0.65, help="Train ratio")
