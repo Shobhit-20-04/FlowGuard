@@ -3,7 +3,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Framework](https://img.shields.io/badge/Framework-SAFE--3WD-success.svg)](docs/ARCHITECTURE.md)
-[![Tests](https://img.shields.io/badge/Tests-48%20Passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-64%20Passed-brightgreen.svg)](tests/)
 [![CLI](https://img.shields.io/badge/CLI-flowguard-blue.svg)](flowguard/cli.py)
 
 **FlowGuard** is an open-source, reproducible research framework for **Sampling-Aware Network Intrusion Detection Systems (NIDS)** under high-speed packet decimation (e.g., 1-in-10 to 1-in-100 sampling rates) and burst packet loss.
@@ -64,8 +64,8 @@ FlowGuard includes a unified CLI for end-to-end execution:
 # Validate processed dataset splits and schema alignment
 python -m flowguard.cli data validate
 
-# Prepare and partition benchmark datasets
-python -m flowguard.cli data prepare --samples 50000 --seed 42
+# Prepare and partition benchmark datasets (explicit synthetic opt-in)
+python -m flowguard.cli data prepare --synthetic --samples 50000 --seed 42
 
 # Train regularized base classifier
 python -m flowguard.cli train --model lightgbm
@@ -103,7 +103,7 @@ pip install -e .
 ```
 
 ### Running Tests
-Execute the comprehensive test suite (48 unit tests covering all components):
+Execute the comprehensive test suite (64 unit and integration tests covering all mathematical and operational components):
 ```bash
 pytest -v
 ```
@@ -140,7 +140,7 @@ FlowGuard/
 │   ├── models/            # Base classifiers (LightGBM, XGBoost) & baselines (B1-B4, MICE)
 │   └── evaluation/        # Cost-sensitive metrics, disaggregated rates, and diagnostics
 ├── experiments/           # Benchmark and evaluation scripts (00 to 06)
-├── tests/                 # Unit and regression test suite (48 tests)
+├── tests/                 # Unit and regression test suite (64 tests)
 ├── configs/               # System configuration (default_config.yaml)
 ├── docs/                  # Architecture, methodology, and reproducibility documentation
 ├── requirements.txt       # Core project dependencies

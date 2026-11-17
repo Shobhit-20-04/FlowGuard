@@ -20,31 +20,38 @@ Assuming individual packet sizes follow $S_i \sim \text{Gamma}(\alpha, \beta)$, 
 $$V_{\text{unobs}} \mid U \sim \text{Gamma}(U \cdot \alpha, \beta), \quad V_{\text{rec}} = V_{\text{obs}} + V_{\text{unobs}}$$
 *Strict Scoping:* Applied strictly to additive volume features (`totlen_fwd_pkts`, `totlen_bwd_pkts`, `tot_fwd_bytes`, `tot_bwd_bytes`). Point-in-time negotiation fields (TCP window sizes `init_win_bytes_fwd/bwd`) are strictly excluded.
 
-## 3. Harmonic Temporal Inversion
+## 3. Semiparametric Latent Gaussian Copula & Sparse-Flow Posterior
 
-Inter-arrival times between sampled packets compound over geometric skips:
-$$\mathbb{E}[\Delta t_{\text{orig}}] = p \cdot \mathbb{E}[\Delta t_{\text{sampled}}]$$
+- **Gaussian Copula:** Preserves non-linear cross-feature rank dependence using semiparametric normal scores $Z_j = \Phi^{-1}((\text{rank}(X_j) - 0.5) / N)$. Symmetrized and regularized via spectral eigenvalue clipping ($\lambda_i \ge 10^{-4}$) and diagonal rescaling to guarantee positive definiteness.
+- **Sparse-Flow Posterior ($k=0$):** Under the empirical prior $P(N=n \mid H_1)$, two-way flows with decimated counts are reconstructed from the exact normalized posterior:
+  $$P(N = n \mid k = 0, H_1, p) = \frac{P(N = n \mid H_1) (1 - p)^n}{\sum_{m \ge 1} P(N = m \mid H_1) (1 - p)^m}$$
 
-## 4. Epistemic Uncertainty Propagation
+## 4. Constrained Geometric Temporal Inversion
+
+Inter-arrival times between sampled packets compound over geometric skips. Moments are recovered via Wald's identity and the law of total variance:
+$$\mathbb{E}[\tau_{\text{orig}}] = p \cdot \mathbb{E}[\tau_{\text{sampled}}]$$
+$$\text{Var}(\tau_{\text{orig}}) = \max\left(\epsilon, p \cdot \text{Var}(\tau_{\text{sampled}}) - p (1 - p) (\mathbb{E}[\tau_{\text{sampled}}])^2\right)$$
+
+## 5. Epistemic Uncertainty Propagation
 
 For each sampled flow feature vector $\tilde{X}$, SDUM generates $S$ Monte Carlo posterior draws:
 $$X^{(s)} \sim P(X \mid \tilde{X}, p), \quad s = 1, \dots, S$$
 Evaluating through the base classifier $f_\theta$ yields risk distribution $\{R^{(1)}, \dots, R^{(S)}\}$:
 - **Mean Risk:** $\bar{R} = \frac{1}{S} \sum_{s=1}^S R^{(s)}$
-- **Epistemic Spread:** $\sigma_R = \text{std}(R^{(s)})$
-- **90% Bayesian Credible Interval:** $[\hat{q}_{0.05}, \hat{q}_{0.95}]$
+- **Epistemic Variance:** $\sigma_R^2 = \text{Var}(R^{(s)})$
+- **Central Bayesian Credible Interval ($\alpha = 0.90$):** $[R_{q_{0.05}}, R_{q_{0.95}}]$
 - **Sample Extrema:** $[R_{\min}, R_{\max}]$
 
-## 5. SAFE-3WD Cost-Sensitive Decision Calibration
+## 6. SAFE-3WD Cost-Sensitive Decision Calibration
 
-Flows are partitioned into three disjoint operational actions:
-1. **Accept (Pass):** $\bar{R} \le \tau_L \;\land\; \sigma_R \le \tau_U$
-2. **Reject (Block):** $\bar{R} \ge \tau_H \;\land\; \sigma_R \le \tau_U$
-3. **Investigate (Triage):** $\sigma_R > \tau_U \;\lor\; (\tau_L < \bar{R} < \tau_H)$
+Flows are partitioned into three mutually disjoint operational actions:
+1. **Accept Benign ($\Omega_A$):** $R_{q_{0.95}} < \tau_{\text{safe}} \;\land\; \sigma_R^2 \le \sigma_{\max}^2$
+2. **Immediate Block ($\Omega_D$):** $R_{q_{0.05}} > \tau_{\text{attack}} \;\land\; \sigma_R^2 \le \sigma_{\max}^2$
+3. **Investigate / Defer ($\Omega_R$):** $\text{Complement of } (\Omega_A \cup \Omega_D)$
 
-### Strict Disaggregated Metric Accounting:
-$$\text{Direct DR} + \text{Attack Inv Rate} + \text{Definite FNR} = 1.0$$
-$$\text{Direct FPR} + \text{Benign Inv Rate} + \text{Direct TNR} = 1.0$$
-$$\text{Post-Triage DR} = \text{Direct DR} + \rho_{\text{sec}} \cdot \text{Attack Inv Rate}$$
-$$\mathcal{C} = c_{\text{FP}} \cdot \text{Direct FPR} + c_{\text{FN}} \cdot \text{Definite FNR} + c_{\text{inv}} \cdot \text{Inv Rate}$$
-where $\rho_{\text{sec}} \in [0, 1]$ represents secondary deep-inspection triage efficacy.
+### Continuous Expected Cost Accounting:
+Decouples primary classification from secondary triage performance:
+$$\mathbb{E}[\text{FN}_{\text{residual}}] = (1 - \text{TPR}_{\text{sec}}) \cdot N_{\text{inv}}^{\text{attack}}$$
+$$\mathbb{E}[\text{FP}_{\text{secondary}}] = \text{FPR}_{\text{sec}} \cdot N_{\text{inv}}^{\text{benign}}$$
+$$\mathcal{C}_{\text{total}} = \frac{1}{N} \left[ C_{\text{FN}} (\text{FN}_{\text{direct}} + \mathbb{E}[\text{FN}_{\text{residual}}]) + C_{\text{FP}} (\text{FP}_{\text{direct}} + \mathbb{E}[\text{FP}_{\text{secondary}}]) + C_{\text{INV}} N_{\text{inv}} \right]$$
+where $\text{TPR}_{\text{sec}}, \text{FPR}_{\text{sec}} \in [0, 1]$ represent secondary deep-inspection triage efficacy.
