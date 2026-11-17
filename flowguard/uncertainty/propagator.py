@@ -30,6 +30,9 @@ class RiskProfile:
     raw_risk_matrix: np.ndarray  # Shape (N, S): Full Monte Carlo risk evaluations
     risk_q05: Optional[np.ndarray] = None  # Shape (N,): 5th percentile risk (lower 90% credible bound)
     risk_q95: Optional[np.ndarray] = None  # Shape (N,): 95th percentile risk (upper 90% credible bound)
+    alpha_confidence: float = 0.90          # Coverage level alpha in (0, 1)
+    risk_q_low: Optional[np.ndarray] = None # Shape (N,): Lower credible bound Q((1-alpha)/2)
+    risk_q_high: Optional[np.ndarray] = None # Shape (N,): Upper credible bound Q((1+alpha)/2)
 
     def to_dataframe(self, include_credible_interval: bool = False) -> pd.DataFrame:
         """
@@ -44,9 +47,13 @@ class RiskProfile:
             "risk_spread": self.risk_spread,
             "risk_median": self.risk_median,
         }
-        if include_credible_interval and self.risk_q05 is not None and self.risk_q95 is not None:
-            data["risk_q05"] = self.risk_q05
-            data["risk_q95"] = self.risk_q95
+        if include_credible_interval:
+            if self.risk_q_low is not None and self.risk_q_high is not None:
+                data["risk_q_low"] = self.risk_q_low
+                data["risk_q_high"] = self.risk_q_high
+            if self.risk_q05 is not None and self.risk_q95 is not None:
+                data["risk_q05"] = self.risk_q05
+                data["risk_q95"] = self.risk_q95
         return pd.DataFrame(data)
 
 
@@ -59,16 +66,19 @@ class UncertaintyPropagator:
         base_classifier: Any,
         sdum: SamplingDistortionUncertaintyModel,
         n_mc_samples: int = 30,
+        alpha_confidence: float = 0.90,
     ):
         self.base_classifier = base_classifier
         self.sdum = sdum
         self.n_mc_samples = n_mc_samples
+        self.alpha_confidence = float(alpha_confidence)
 
     def propagate(
         self,
         X_sampled: pd.DataFrame,
         sampling_rate: float,
         n_mc_samples: Optional[int] = None,
+        alpha_confidence: Optional[float] = None,
     ) -> RiskProfile:
         """
         Propagates degraded flow records through SDUM reconstruction and base classifier inference.
@@ -113,7 +123,16 @@ class UncertaintyPropagator:
         # Each column s contains the predictions for realization s across all N flows
         risk_matrix = probs_flat.reshape((S, n_rows)).T  # Shape: (N, S)
 
-        # 3. Compute Per-Flow Epistemic Risk Statistics
+        # 3. Compute Per-Flow Epistemic Risk Statistics & Credible Quantiles
+        alpha = float(alpha_confidence if alpha_confidence is not None else self.alpha_confidence)
+        assert 0.0 < alpha < 1.0, f"alpha_confidence must be in (0, 1), got {alpha}"
+
+        # Central credible interval quantiles:
+        # Lower: (1 - alpha) / 2  (e.g., 0.05 for alpha=0.90)
+        # Upper: (1 + alpha) / 2  (e.g., 0.95 for alpha=0.90)
+        q_low_pct = 100.0 * (1.0 - alpha) / 2.0
+        q_high_pct = 100.0 * (1.0 + alpha) / 2.0
+
         r_min = np.min(risk_matrix, axis=1)
         r_max = np.max(risk_matrix, axis=1)
         r_mean = np.mean(risk_matrix, axis=1)
@@ -121,6 +140,8 @@ class UncertaintyPropagator:
         r_std = np.sqrt(np.maximum(0.0, r_var))
         r_spread = r_max - r_min
         r_median = np.median(risk_matrix, axis=1)
+        r_q_low = np.percentile(risk_matrix, q_low_pct, axis=1) if S > 1 else r_min
+        r_q_high = np.percentile(risk_matrix, q_high_pct, axis=1) if S > 1 else r_max
         r_q05 = np.percentile(risk_matrix, 5.0, axis=1) if S > 1 else r_min
         r_q95 = np.percentile(risk_matrix, 95.0, axis=1) if S > 1 else r_max
 
@@ -134,5 +155,8 @@ class UncertaintyPropagator:
             risk_median=r_median,
             risk_q05=r_q05,
             risk_q95=r_q95,
+            alpha_confidence=alpha,
+            risk_q_low=r_q_low,
+            risk_q_high=r_q_high,
             raw_risk_matrix=risk_matrix,
         )

@@ -38,11 +38,14 @@ By Bayes' theorem, the posterior of unobserved packets U given observed k packet
 Both priors are fully supported and mathematically validated.
 """
 
+import logging
 from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 import scipy.stats as stats
 import scipy.special as special
+
+logger = logging.getLogger(__name__)
 
 from flowguard.sampling.distortion_math import (
     binomial_count_moments,
@@ -77,6 +80,7 @@ class SamplingDistortionUncertaintyModel:
         preserve_correlation: bool = True,
         probe_prior: float = 0.40,
         prior: str = "scale_invariant",
+        enable_compound_gamma: bool = True,
     ):
         if prior not in ["scale_invariant", "uniform"]:
             raise ValueError(f"Unknown prior '{prior}'. Must be 'scale_invariant' or 'uniform'.")
@@ -86,6 +90,7 @@ class SamplingDistortionUncertaintyModel:
         self.preserve_correlation = preserve_correlation
         self.probe_prior = probe_prior
         self.prior = prior
+        self.enable_compound_gamma = bool(enable_compound_gamma)
         self.rng = np.random.default_rng(random_state)
 
         # Learned empirical priors and correlation structures
@@ -98,6 +103,7 @@ class SamplingDistortionUncertaintyModel:
 
         # Empirical Bayes latent regime parameters
         self.empirical_probe_prior_: float = float(probe_prior)
+        self.empirical_two_way_bwd_counts_: Optional[np.ndarray] = None
         self.empirical_bwd_ratio_median_: float = 0.50
         self.empirical_bwd_ratio_std_: float = 0.15
 
@@ -106,6 +112,15 @@ class SamplingDistortionUncertaintyModel:
         self.fwd_pkt_gamma_scale_: float = 100.0
         self.bwd_pkt_gamma_shape_: float = 2.0
         self.bwd_pkt_gamma_scale_: float = 200.0
+
+        # Copula fallback and status tracking
+        self.copula_fallback_used_: bool = False
+        self.copula_status_: str = "not_fitted"
+        self.copula_regularized_corr_: Optional[np.ndarray] = None
+
+        # Sparse-flow finite-support and tail attributes
+        self.max_support_bwd_: Optional[int] = None
+        self.posterior_tail_mass_at_boundary_: Optional[float] = None
 
     def fit(self, X_pristine: pd.DataFrame) -> "SamplingDistortionUncertaintyModel":
         """
@@ -132,17 +147,21 @@ class SamplingDistortionUncertaintyModel:
             unidir_mask = (bwd_vals == 0)
             self.empirical_probe_prior_ = float(np.mean(unidir_mask))
 
-            # Bidirectional flows: fit backward-to-forward packet ratio
-            bidir_mask = (bwd_vals > 0) & (fwd_vals > 0)
+            # Bidirectional flows: fit backward-to-forward packet ratio and preserve positive counts
+            bidir_mask = (bwd_vals > 0)
             if bidir_mask.any():
-                ratios = bwd_vals[bidir_mask] / np.maximum(1.0, fwd_vals[bidir_mask])
+                self.empirical_two_way_bwd_counts_ = bwd_vals[bidir_mask].astype(np.float64)
+                fwd_positive = fwd_vals[bidir_mask]
+                ratios = bwd_vals[bidir_mask] / np.maximum(1.0, fwd_positive)
                 self.empirical_bwd_ratio_median_ = float(np.median(ratios))
                 self.empirical_bwd_ratio_std_ = float(np.std(ratios) + 1e-4)
             else:
+                self.empirical_two_way_bwd_counts_ = np.array([5.0])
                 self.empirical_bwd_ratio_median_ = 0.50
                 self.empirical_bwd_ratio_std_ = 0.15
         else:
             self.empirical_probe_prior_ = float(self.probe_prior)
+            self.empirical_two_way_bwd_counts_ = np.array([5.0])
             self.empirical_bwd_ratio_median_ = 0.50
             self.empirical_bwd_ratio_std_ = 0.15
 
@@ -167,29 +186,74 @@ class SamplingDistortionUncertaintyModel:
                 self.bwd_pkt_gamma_shape_ = max(0.5, mu_b / self.bwd_pkt_gamma_scale_)
 
         # Correlation preservation across core volume and temporal features
+        # Focus on features whose marginal inversion uses the Gaussian Copula uniform variates
         candidate_cols = [
             "total_fwd_packets",
             "total_bwd_packets",
             "total_fwd_bytes",
             "total_bwd_bytes",
-            "flow_duration",
-            "flow_bytes_per_s",
-            "flow_packets_per_s",
-            "flow_iat_mean",
         ]
         self.tracked_corr_cols_ = [c for c in candidate_cols if c in self.feature_names_]
 
         if self.preserve_correlation and len(self.tracked_corr_cols_) > 1:
             sub_df = X_pristine[self.tracked_corr_cols_].fillna(0.0)
-            corr_mat = sub_df.corr().values
-            reg_corr = corr_mat + np.eye(len(corr_mat)) * 1e-4
-            reg_corr = reg_corr / np.sqrt(np.outer(np.diag(reg_corr), np.diag(reg_corr)))
+            n_p = len(sub_df)
+
+            # Semiparametric Latent Gaussian Copula Estimation:
+            # Map empirical sample marginals to standard normal scores Z = Phi^{-1}((rank - 0.5) / n).
+            # This captures monotone rank dependence invariant to heavy-tailed non-linear distortions.
+            p_cols = len(self.tracked_corr_cols_)
+            z_scores = np.zeros((n_p, p_cols), dtype=np.float64)
+            for j, c_name in enumerate(self.tracked_corr_cols_):
+                vals_c = sub_df[c_name].values
+                std_c = np.std(vals_c)
+                if std_c < 1e-12:
+                    z_scores[:, j] = 0.0
+                else:
+                    ranks_c = stats.rankdata(vals_c)
+                    u_ranks_c = np.clip((ranks_c - 0.5) / n_p, 1e-5, 1.0 - 1e-5)
+                    z_scores[:, j] = np.sqrt(2.0) * special.erfinv(2.0 * u_ranks_c - 1.0)
+
+            stds = np.std(z_scores, axis=0)
+            is_const = stds < 1e-12
+            raw_corr = np.eye(p_cols)
+            act_idx = np.where(~is_const)[0]
+            if len(act_idx) > 1:
+                sub_corr = np.corrcoef(z_scores[:, act_idx], rowvar=False)
+                for i_s, i_a in enumerate(act_idx):
+                    for j_s, j_a in enumerate(act_idx):
+                        raw_corr[i_a, j_a] = sub_corr[i_s, j_s]
+
+            # Symmetrize
+            sym_corr = 0.5 * (raw_corr + raw_corr.T)
+            # Eigenvalue clipping for strict positive definiteness
+            eigenvals, eigenvecs = np.linalg.eigh(sym_corr)
+            eigenvals = np.maximum(eigenvals, 1e-4)
+            proj_corr = eigenvecs @ np.diag(eigenvals) @ eigenvecs.T
+
+            # Rescale back to exact unit diagonal correlation matrix
+            d_inv = 1.0 / np.sqrt(np.maximum(1e-8, np.diag(proj_corr)))
+            R_unit = proj_corr * np.outer(d_inv, d_inv)
+            R_unit = 0.5 * (R_unit + R_unit.T)
+            np.fill_diagonal(R_unit, 1.0)
+
+            self.copula_regularized_corr_ = R_unit
             try:
-                self.corr_cholesky_ = np.linalg.cholesky(reg_corr)
+                self.corr_cholesky_ = np.linalg.cholesky(R_unit)
+                self.copula_fallback_used_ = False
+                self.copula_status_ = "regularized_cholesky"
             except np.linalg.LinAlgError:
+                logger.warning(
+                    "Gaussian Copula Cholesky decomposition failed; falling back to identity matrix. "
+                    "Cross-feature dependence preservation is degraded or unavailable."
+                )
                 self.corr_cholesky_ = np.eye(len(self.tracked_corr_cols_))
+                self.copula_fallback_used_ = True
+                self.copula_status_ = "identity_fallback_degraded"
         else:
             self.corr_cholesky_ = None
+            self.copula_fallback_used_ = False
+            self.copula_status_ = "disabled"
 
         self.is_fitted = True
         return self
@@ -249,17 +313,55 @@ class SamplingDistortionUncertaintyModel:
             and len(self.tracked_corr_cols_) > 1
         )
 
+        # Precompute Empirical Bayes Posterior PMF and CDF for sampling rate p
+        # P(N = n | k = 0, H_1, p) proportional to P(N = n | H_1) * (1 - p)^n
+        # Normalized by E[(1 - p)^N | H_1] = sum_n P(N = n | H_1) * (1 - p)^n
+        if self.empirical_two_way_bwd_counts_ is not None and len(self.empirical_two_way_bwd_counts_) > 0:
+            unique_bwd, prior_counts = np.unique(self.empirical_two_way_bwd_counts_, return_counts=True)
+            prior_pmf = prior_counts / float(len(self.empirical_two_way_bwd_counts_))
+            unnorm_weights = prior_pmf * ((1.0 - p) ** unique_bwd)
+            e_prob_zero_twoway = float(np.sum(unnorm_weights))
+            post_pmf_bwd = unnorm_weights / max(1e-12, e_prob_zero_twoway)
+            post_cdf_bwd = np.cumsum(post_pmf_bwd)
+            post_cdf_bwd[-1] = 1.0
+
+            # Record upper support boundary and boundary posterior tail mass
+            self.max_support_bwd_ = int(unique_bwd[-1])
+            self.posterior_tail_mass_at_boundary_ = float(post_pmf_bwd[-1])
+            if self.posterior_tail_mass_at_boundary_ > 1e-3:
+                logger.debug(
+                    f"Sparse-flow posterior tail mass at upper boundary N={self.max_support_bwd_} is "
+                    f"{self.posterior_tail_mass_at_boundary_:.5f} (p={p:.3f})."
+                )
+        else:
+            unique_bwd = np.array([1, 2, 3, 5, 10], dtype=np.int64)
+            mu_b = max(1.0, self.empirical_bwd_ratio_median_ * self.empirical_medians_.get("total_fwd_packets", 5.0))
+            q_geom = 1.0 / mu_b
+            e_prob_zero_twoway = float((q_geom * (1.0 - p)) / max(1e-6, 1.0 - (1.0 - q_geom) * (1.0 - p)))
+            post_cdf_bwd = None
+            self.max_support_bwd_ = 10
+            self.posterior_tail_mass_at_boundary_ = 0.0
+
+        e_prob_zero_twoway = float(np.clip(e_prob_zero_twoway, 1e-8, 1.0))
+        pi_p = float(np.clip(self.empirical_probe_prior_, 1e-4, 1.0 - 1e-4))
+        posterior_probe_prob = (pi_p * 1.0) / (pi_p * 1.0 + (1.0 - pi_p) * e_prob_zero_twoway)
+        posterior_probe_prob = float(np.clip(posterior_probe_prob, 0.001, 0.999))
+
         reconstructed_dfs: List[pd.DataFrame] = []
 
         # Vectorized draws for S realizations
         for s in range(S):
             df_s = X_sampled.copy()
 
-            # Latent hypothesis for sparse flows:
-            # Z = 1: Flow was originally a small probe / scan / short transaction
-            # Z = 0: Flow was originally a multi-packet session decimated by sampling
-            probe_prob = float(np.clip(self.empirical_probe_prior_, 0.05, 0.95))
-            z_sparse = self.rng.binomial(1, probe_prob, size=n_rows).astype(bool)
+            # Latent hypothesis for flows with 0 observed backward packets:
+            # Z = 1: Flow is a unidirectional probe / scan (true N_bwd = 0)
+            # Z = 0: Flow is a two-way session with packets unobserved due to decimation (true N_bwd >= 1)
+            z_sparse = np.zeros(n_rows, dtype=bool)
+            bwd_zero_all = (k_bwd == 0)
+            if bwd_zero_all.any():
+                z_sparse[bwd_zero_all] = self.rng.binomial(
+                    1, posterior_probe_prob, size=int(bwd_zero_all.sum())
+                ).astype(bool)
 
             # Generate correlated uniform variates via Gaussian Copula if enabled
             if use_copula:
@@ -300,18 +402,38 @@ class SamplingDistortionUncertaintyModel:
                     u_bwd[idx_bwd] = missed_bwd
                     n_hat_bwd[idx_bwd] = k_bwd[idx_bwd] + missed_bwd
 
-                # Directional zero-observation handling under uniform prior:
-                # When k_bwd == 0, under prior="uniform", unobserved count U ~ NegBin(1, p)
+                # Directional zero-observation handling:
+                # When k_bwd == 0 in multi-packet flows, the flow is two-way if z_sparse == False.
+                # Its conditional support MUST satisfy N_bwd >= 1.
                 bwd_zero = (k_bwd[multi_mask] == 0)
-                if self.prior == "uniform" and bwd_zero.any():
-                    idx_bwd_z = np.where(multi_mask)[0][bwd_zero]
-                    if use_copula and "total_bwd_packets" in corr_col_idx:
-                        idx_cb = corr_col_idx["total_bwd_packets"]
-                        missed_bwd_z = stats.nbinom.ppf(u_corr[idx_bwd_z, idx_cb], n=1, p=p).astype(np.int64)
-                    else:
-                        missed_bwd_z = self.rng.negative_binomial(n=1, p=p, size=len(idx_bwd_z))
-                    u_bwd[idx_bwd_z] = missed_bwd_z
-                    n_hat_bwd[idx_bwd_z] = missed_bwd_z
+                if bwd_zero.any():
+                    idx_bwd_z_all = np.where(multi_mask)[0][bwd_zero]
+                    # Filter for two-way flows (z_sparse == False)
+                    is_twoway = ~z_sparse[idx_bwd_z_all]
+                    if is_twoway.any():
+                        idx_bwd_z = idx_bwd_z_all[is_twoway]
+                        n_z = len(idx_bwd_z)
+                        if post_cdf_bwd is not None and self.prior != "uniform":
+                            # Exact Empirical Bayes posterior draw:
+                            # P(N = n | k = 0, H_1, p) proportional to P(N = n | H_1) * (1 - p)^n
+                            if use_copula and "total_bwd_packets" in corr_col_idx:
+                                idx_cb = corr_col_idx["total_bwd_packets"]
+                                u_sub_b = u_corr[idx_bwd_z, idx_cb]
+                            else:
+                                u_sub_b = self.rng.uniform(size=n_z)
+                            samp_indices = np.searchsorted(post_cdf_bwd, u_sub_b)
+                            n_draws = unique_bwd[np.clip(samp_indices, 0, len(unique_bwd) - 1)]
+                            n_hat_bwd[idx_bwd_z] = np.maximum(1, n_draws)
+                            u_bwd[idx_bwd_z] = n_hat_bwd[idx_bwd_z]
+                        else:
+                            # Uniform positive-integer prior: N = 1 + NegBin(1, p)
+                            if use_copula and "total_bwd_packets" in corr_col_idx:
+                                idx_cb = corr_col_idx["total_bwd_packets"]
+                                missed_bwd_z = stats.nbinom.ppf(u_corr[idx_bwd_z, idx_cb], n=1, p=p).astype(np.int64)
+                            else:
+                                missed_bwd_z = self.rng.negative_binomial(n=1, p=p, size=n_z)
+                            n_hat_bwd[idx_bwd_z] = np.maximum(1, 1 + missed_bwd_z)
+                            u_bwd[idx_bwd_z] = n_hat_bwd[idx_bwd_z]
 
             # Sparse flows: Empirical Bayes Mixture draws
             if sparse_mask.any():
@@ -342,19 +464,32 @@ class SamplingDistortionUncertaintyModel:
                     )
                     u_fwd[session_indices] = n_hat_fwd[session_indices] - k_fwd[session_indices]
 
-                    # Empirical Bayes backward packet ratio
-                    bwd_ratio_draw = np.clip(
-                        self.rng.normal(
-                            loc=self.empirical_bwd_ratio_median_,
-                            scale=self.empirical_bwd_ratio_std_,
-                            size=n_sess,
-                        ),
-                        0.05,
-                        3.0,
-                    )
-                    n_hat_bwd[session_indices] = np.maximum(
-                        1, (n_hat_fwd[session_indices] * bwd_ratio_draw).astype(np.int64)
-                    )
+                    # Backward packet reconstruction under Z = 0
+                    if post_cdf_bwd is not None and self.prior != "uniform":
+                        # Exact Empirical Bayes posterior sampling
+                        if use_copula and "total_bwd_packets" in corr_col_idx:
+                            idx_cb = corr_col_idx["total_bwd_packets"]
+                            u_sub_b = u_corr[session_indices, idx_cb]
+                        else:
+                            u_sub_b = self.rng.uniform(size=n_sess)
+                        samp_indices = np.searchsorted(post_cdf_bwd, u_sub_b)
+                        n_hat_bwd[session_indices] = np.maximum(
+                            1, unique_bwd[np.clip(samp_indices, 0, len(unique_bwd) - 1)]
+                        )
+                    else:
+                        # Empirical Bayes backward packet ratio or uniform prior
+                        bwd_ratio_draw = np.clip(
+                            self.rng.normal(
+                                loc=self.empirical_bwd_ratio_median_,
+                                scale=self.empirical_bwd_ratio_std_,
+                                size=n_sess,
+                            ),
+                            0.05,
+                            3.0,
+                        )
+                        n_hat_bwd[session_indices] = np.maximum(
+                            1, (n_hat_fwd[session_indices] * bwd_ratio_draw).astype(np.int64)
+                        )
                     u_bwd[session_indices] = np.maximum(
                         0, n_hat_bwd[session_indices] - k_bwd[session_indices]
                     )
@@ -366,42 +501,55 @@ class SamplingDistortionUncertaintyModel:
 
             n_hat_tot = n_hat_fwd + n_hat_bwd
 
-            # 2. Compound Gamma Volume Reconstruction
-            # For unobserved packets U, added volume Delta_V ~ Gamma(U * alpha, scale)
-            # This follows from the reproductive property of Gamma distributions for i.i.d. packet lengths.
+            # 2. Volume Reconstruction (Compound Gamma vs Deterministic)
+            # When enable_compound_gamma=True, added volume Delta_V ~ Gamma(U * alpha, scale),
+            # strictly compounding individual packet payload lengths.
+            # When enable_compound_gamma=False (ablation mode), volume is rescaled linearly without Gamma variance.
             u_fwd_pos = u_fwd > 0
             delta_bytes_fwd = np.zeros(n_rows, dtype=np.float64)
             if u_fwd_pos.any():
-                shapes_fwd = np.maximum(0.1, u_fwd[u_fwd_pos] * self.fwd_pkt_gamma_shape_)
-                if use_copula and "total_fwd_bytes" in corr_col_idx:
-                    idx_cf = corr_col_idx["total_fwd_bytes"]
-                    delta_bytes_fwd[u_fwd_pos] = stats.gamma.ppf(
-                        u_corr[u_fwd_pos, idx_cf],
-                        a=shapes_fwd,
-                        scale=self.fwd_pkt_gamma_scale_,
-                    )
+                if self.enable_compound_gamma:
+                    shapes_fwd = np.maximum(0.1, u_fwd[u_fwd_pos] * self.fwd_pkt_gamma_shape_)
+                    if use_copula and "total_fwd_bytes" in corr_col_idx:
+                        idx_cf = corr_col_idx["total_fwd_bytes"]
+                        delta_bytes_fwd[u_fwd_pos] = stats.gamma.ppf(
+                            u_corr[u_fwd_pos, idx_cf],
+                            a=shapes_fwd,
+                            scale=self.fwd_pkt_gamma_scale_,
+                        )
+                    else:
+                        delta_bytes_fwd[u_fwd_pos] = self.rng.gamma(
+                            shape=shapes_fwd,
+                            scale=self.fwd_pkt_gamma_scale_,
+                        )
                 else:
-                    delta_bytes_fwd[u_fwd_pos] = self.rng.gamma(
-                        shape=shapes_fwd,
-                        scale=self.fwd_pkt_gamma_scale_,
-                    )
+                    # Ablation baseline: linear rescaling without Gamma stochastic compounding
+                    obs_fwd_b = df_s["total_fwd_bytes"].values[u_fwd_pos] if "total_fwd_bytes" in df_s.columns else 0.0
+                    mean_len_fwd = obs_fwd_b / np.maximum(1, k_fwd[u_fwd_pos])
+                    delta_bytes_fwd[u_fwd_pos] = u_fwd[u_fwd_pos] * mean_len_fwd
 
             u_bwd_pos = u_bwd > 0
             delta_bytes_bwd = np.zeros(n_rows, dtype=np.float64)
             if u_bwd_pos.any():
-                shapes_bwd = np.maximum(0.1, u_bwd[u_bwd_pos] * self.bwd_pkt_gamma_shape_)
-                if use_copula and "total_bwd_bytes" in corr_col_idx:
-                    idx_cb = corr_col_idx["total_bwd_bytes"]
-                    delta_bytes_bwd[u_bwd_pos] = stats.gamma.ppf(
-                        u_corr[u_bwd_pos, idx_cb],
-                        a=shapes_bwd,
-                        scale=self.bwd_pkt_gamma_scale_,
-                    )
+                if self.enable_compound_gamma:
+                    shapes_bwd = np.maximum(0.1, u_bwd[u_bwd_pos] * self.bwd_pkt_gamma_shape_)
+                    if use_copula and "total_bwd_bytes" in corr_col_idx:
+                        idx_cb = corr_col_idx["total_bwd_bytes"]
+                        delta_bytes_bwd[u_bwd_pos] = stats.gamma.ppf(
+                            u_corr[u_bwd_pos, idx_cb],
+                            a=shapes_bwd,
+                            scale=self.bwd_pkt_gamma_scale_,
+                        )
+                    else:
+                        delta_bytes_bwd[u_bwd_pos] = self.rng.gamma(
+                            shape=shapes_bwd,
+                            scale=self.bwd_pkt_gamma_scale_,
+                        )
                 else:
-                    delta_bytes_bwd[u_bwd_pos] = self.rng.gamma(
-                        shape=shapes_bwd,
-                        scale=self.bwd_pkt_gamma_scale_,
-                    )
+                    # Ablation baseline: linear rescaling without Gamma stochastic compounding
+                    obs_bwd_b = df_s["total_bwd_bytes"].values[u_bwd_pos] if "total_bwd_bytes" in df_s.columns else 0.0
+                    mean_len_bwd = obs_bwd_b / np.maximum(1, k_bwd[u_bwd_pos])
+                    delta_bytes_bwd[u_bwd_pos] = u_bwd[u_bwd_pos] * mean_len_bwd
 
             # Apply volume updates strictly to additive volume features (excluding window sizes)
             for col in df_s.columns:

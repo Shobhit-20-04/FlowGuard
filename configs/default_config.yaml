@@ -52,8 +52,9 @@ sampling_degradation:
 uncertainty_model:
   num_monte_carlo_draws: 30 # S = 30 plausible true flow reconstructions per sampled flow
   distribution_type: "negative_binomial" # For packet counts; compound gamma for volumes & durations
-  preserve_correlation: true # Gaussian Copula correlation preservation across features
-  alpha_confidence: 0.90 # Coverage level for credible intervals (matches 5th/95th percentiles)
+  preserve_correlation: true # Latent Gaussian Copula correlation preservation across features
+  alpha_confidence: 0.90 # Confidence level alpha in (0, 1): lower=(1-alpha)/2 (q05), upper=(1+alpha)/2 (q95)
+  enable_compound_gamma: true # Compound Gamma volume modeling (set false for count-only ablation)
 
 base_classifiers:
   selected: "lightgbm" # Options: lightgbm, random_forest, xgboost
@@ -72,7 +73,8 @@ base_classifiers:
     random_state: 42
 
 three_way_decision_policy:
-  policy_type: "quantile" # Options: quantile (minimax bound), moment (mean & variance bound)
+  policy_type: "quantile" # Options: quantile (credible interval bounds), moment (mean & variance bound)
+  alpha_confidence: 0.90 # Central credible interval coverage: Q((1-alpha)/2) and Q((1+alpha)/2)
   k_sigma: 1.0 # Moment policy multiplier for standard deviation bound
   optimization_target: "cost_sensitive_risk"
   # Calibrated on validation set
