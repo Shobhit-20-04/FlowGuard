@@ -28,6 +28,7 @@ class CostSensitiveThresholdCalibrator:
         grid_steps: int = 25,
         policy: str = "quantile",
         k_sigma: float = 1.0,
+        alpha_confidence: Optional[float] = 0.90,
     ):
         self.cost_fn = float(cost_fn)
         self.cost_fp = float(cost_fp)
@@ -36,6 +37,7 @@ class CostSensitiveThresholdCalibrator:
         self.grid_steps = int(grid_steps)
         self.policy = policy
         self.k_sigma = float(k_sigma)
+        self.alpha_confidence = float(alpha_confidence) if alpha_confidence is not None else None
 
         # Calibrated parameters
         self.is_fitted: bool = False
@@ -75,6 +77,28 @@ class CostSensitiveThresholdCalibrator:
         r_var = calibration_risk_profile.risk_variance
         sigma_r = np.sqrt(np.maximum(0.0, r_var))
 
+        # Quantile bounds for quantile policy
+        if self.policy == "quantile":
+            if self.alpha_confidence is not None and self.alpha_confidence < 1.0:
+                alpha = self.alpha_confidence
+                q_low = 100.0 * (1.0 - alpha) / 2.0
+                q_high = 100.0 * (1.0 + alpha) / 2.0
+                if getattr(calibration_risk_profile, "risk_q_low", None) is not None and getattr(calibration_risk_profile, "alpha_confidence", None) == alpha:
+                    r_lower = calibration_risk_profile.risk_q_low
+                    r_upper = calibration_risk_profile.risk_q_high
+                elif getattr(calibration_risk_profile, "raw_risk_matrix", None) is not None and calibration_risk_profile.raw_risk_matrix.shape[1] > 1:
+                    r_lower = np.percentile(calibration_risk_profile.raw_risk_matrix, q_low, axis=1)
+                    r_upper = np.percentile(calibration_risk_profile.raw_risk_matrix, q_high, axis=1)
+                elif np.isclose(alpha, 0.90) and getattr(calibration_risk_profile, "risk_q05", None) is not None:
+                    r_lower = calibration_risk_profile.risk_q05
+                    r_upper = calibration_risk_profile.risk_q95
+                else:
+                    r_lower = r_min
+                    r_upper = r_max
+            else:
+                r_lower = r_min
+                r_upper = r_max
+
         # Search grid
         tau_safe_candidates = np.linspace(0.05, 0.45, self.grid_steps)
         tau_attack_candidates = np.linspace(0.55, 0.95, self.grid_steps)
@@ -99,7 +123,7 @@ class CostSensitiveThresholdCalibrator:
 
             for t_safe in tau_safe_candidates:
                 if self.policy == "quantile":
-                    benign_mask = (r_max < t_safe) & var_ok
+                    benign_mask = (r_upper < t_safe) & var_ok
                 else:
                     benign_mask = (r_mean + self.k_sigma * sigma_r < t_safe) & var_ok
 
@@ -108,7 +132,7 @@ class CostSensitiveThresholdCalibrator:
                         continue
 
                     if self.policy == "quantile":
-                        attack_mask = (r_min > t_attack) & var_ok
+                        attack_mask = (r_lower > t_attack) & var_ok
                     else:
                         attack_mask = (r_mean - self.k_sigma * sigma_r > t_attack) & var_ok
 
@@ -187,4 +211,5 @@ class CostSensitiveThresholdCalibrator:
             max_acceptable_variance=self.optimal_sigma_thresh_,
             policy=self.policy,
             k_sigma=self.k_sigma,
+            alpha_confidence=self.alpha_confidence,
         )

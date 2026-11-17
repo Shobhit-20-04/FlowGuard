@@ -84,6 +84,7 @@ class SafeThreeWayDecisionEngine:
         max_acceptable_variance: float = 0.04,
         policy: str = "quantile",
         k_sigma: float = 1.0,
+        alpha_confidence: Optional[float] = 0.90,
     ):
         assert 0.0 < tau_safe <= tau_attack < 1.0, (
             f"Invalid threshold bounds: tau_safe ({tau_safe}) must be <= tau_attack ({tau_attack}) in (0, 1)!"
@@ -91,11 +92,17 @@ class SafeThreeWayDecisionEngine:
         if policy not in ["quantile", "moment"]:
             raise ValueError(f"Unknown decision policy '{policy}'. Must be 'quantile' or 'moment'.")
 
+        if alpha_confidence is not None:
+            assert 0.0 < alpha_confidence <= 1.0, (
+                f"alpha_confidence must be in (0, 1], got {alpha_confidence}"
+            )
+
         self.tau_safe = float(tau_safe)
         self.tau_attack = float(tau_attack)
         self.max_acceptable_variance = float(max_acceptable_variance)
         self.policy = policy
         self.k_sigma = float(k_sigma)
+        self.alpha_confidence = float(alpha_confidence) if alpha_confidence is not None else None
 
     def decide(self, risk_profile: RiskProfile) -> ThreeWayDecisionResult:
         """
@@ -121,11 +128,36 @@ class SafeThreeWayDecisionEngine:
         var_ok = (r_var <= self.max_acceptable_variance)
 
         if self.policy == "quantile":
-            # Empirical minimax quantile policy:
-            # Region 1 (Benign / Fast Accept): R_max < tau_safe and sigma_R^2 <= max_acceptable_variance
-            # Region 2 (Attack / Immediate Block): R_min > tau_attack and sigma_R^2 <= max_acceptable_variance
-            benign_mask = (r_max < self.tau_safe) & var_ok
-            attack_mask = (r_min > self.tau_attack) & var_ok
+            # Quantile Credible Interval Policy:
+            # For confidence level alpha in (0, 1), evaluates central credible interval:
+            # Lower bound L = Q((1 - alpha) / 2)  (e.g., q05 for alpha=0.90)
+            # Upper bound U = Q((1 + alpha) / 2)  (e.g., q95 for alpha=0.90)
+            # If alpha_confidence is 1.0 or None, falls back to sample extrema [r_min, r_max].
+            if self.alpha_confidence is not None and self.alpha_confidence < 1.0:
+                alpha = self.alpha_confidence
+                q_low = 100.0 * (1.0 - alpha) / 2.0
+                q_high = 100.0 * (1.0 + alpha) / 2.0
+
+                if getattr(risk_profile, "risk_q_low", None) is not None and getattr(risk_profile, "alpha_confidence", None) == alpha:
+                    r_lower = risk_profile.risk_q_low
+                    r_upper = risk_profile.risk_q_high
+                elif getattr(risk_profile, "raw_risk_matrix", None) is not None and risk_profile.raw_risk_matrix.shape[1] > 1:
+                    r_lower = np.percentile(risk_profile.raw_risk_matrix, q_low, axis=1)
+                    r_upper = np.percentile(risk_profile.raw_risk_matrix, q_high, axis=1)
+                elif np.isclose(alpha, 0.90) and getattr(risk_profile, "risk_q05", None) is not None:
+                    r_lower = risk_profile.risk_q05
+                    r_upper = risk_profile.risk_q95
+                else:
+                    r_lower = r_min
+                    r_upper = r_max
+            else:
+                r_lower = r_min
+                r_upper = r_max
+
+            # Region 1 (Benign / Fast Accept): U < tau_safe and sigma_R^2 <= max_acceptable_variance
+            # Region 2 (Attack / Immediate Block): L > tau_attack and sigma_R^2 <= max_acceptable_variance
+            benign_mask = (r_upper < self.tau_safe) & var_ok
+            attack_mask = (r_lower > self.tau_attack) & var_ok
         elif self.policy == "moment":
             # Moment-bounded policy:
             # Region 1 (Benign): mu_R + k * sigma_R < tau_safe and sigma_R^2 <= max_acceptable_variance
@@ -156,8 +188,8 @@ class SafeThreeWayDecisionEngine:
         # Confidence scores
         confidences = np.zeros(n_rows, dtype=np.float64)
         if self.policy == "quantile":
-            confidences[benign_mask] = np.maximum(0.0, 1.0 - r_max[benign_mask])
-            confidences[attack_mask] = np.maximum(0.0, r_min[attack_mask])
+            confidences[benign_mask] = np.maximum(0.0, 1.0 - r_upper[benign_mask])
+            confidences[attack_mask] = np.maximum(0.0, r_lower[attack_mask])
         else:
             confidences[benign_mask] = np.maximum(0.0, 1.0 - (r_mean[benign_mask] + self.k_sigma * sigma_r[benign_mask]))
             confidences[attack_mask] = np.maximum(0.0, (r_mean[attack_mask] - self.k_sigma * sigma_r[attack_mask]))
@@ -324,14 +356,17 @@ class SafeThreeWayDecisionEngine:
             result["post_triage_fpr"] = post_fpr
 
             # Post-triage residual false negatives and false positives
-            residual_fn = int(round((1.0 - tpr) * attack_inv_count))
-            secondary_fp = int(round(fpr * benign_inv_count))
+            # Exact continuous mathematical expectation:
+            residual_fn_exp = float((1.0 - tpr) * attack_inv_count)
+            secondary_fp_exp = float(fpr * benign_inv_count)
 
             post_triage_cost = (
-                (cost_fn * (false_negatives + residual_fn))
-                + (cost_fp * (false_positives + secondary_fp))
+                (cost_fn * (false_negatives + residual_fn_exp))
+                + (cost_fp * (false_positives + secondary_fp_exp))
                 + (cost_inv * investigated_flows)
             )
+            result["residual_fn_count"] = int(round(residual_fn_exp))
+            result["secondary_fp_count"] = int(round(secondary_fp_exp))
             result["post_triage_operational_cost"] = float(post_triage_cost)
             result["post_triage_cost_per_flow"] = float(post_triage_cost / max(1, len(y_t)))
 
