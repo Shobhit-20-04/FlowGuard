@@ -33,6 +33,24 @@ def test_cli_data_prepare_missing_input_raises_error():
     assert exit_code == 1
 
 
+def test_cli_data_prepare_no_input_no_synthetic_fails():
+    exit_code = main(["data", "prepare"])
+    assert exit_code == 1
+
+
+def test_cli_data_prepare_synthetic_opt_in(tmp_path):
+    exit_code = main([
+        "data", "prepare",
+        "--synthetic",
+        "--samples", "100",
+        "--output-dir", str(tmp_path / "proc_out"),
+    ])
+    assert exit_code == 0
+    assert (tmp_path / "proc_out" / "train.parquet").exists()
+    assert (tmp_path / "proc_out" / "calibration.parquet").exists()
+    assert (tmp_path / "proc_out" / "test.parquet").exists()
+
+
 def test_cli_evaluate_subset():
     exit_code = main([
         "evaluate",
