@@ -10,10 +10,12 @@ Implements the four competitive baseline paradigms against FlowGuard SAFE-3WD:
 """
 
 from typing import Any, Dict, List, Optional, Tuple, Union
+import warnings
 import numpy as np
 import pandas as pd
 
 # Enable IterativeImputer in scikit-learn
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.experimental import enable_iterative_imputer  # noqa: F401
 from sklearn.impute import IterativeImputer
 from sklearn.linear_model import BayesianRidge
@@ -137,7 +139,9 @@ class MICEImputationBaseline:
             sample_posterior=False,
             initial_strategy="median",
         )
-        self.imputer.fit(X_train.values)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=ConvergenceWarning)
+            self.imputer.fit(X_train.values)
         return self
 
     def impute(self, X_degraded: pd.DataFrame, sampling_rate: float) -> pd.DataFrame:
@@ -317,7 +321,8 @@ class TreeEnsembleUncertaintyBaseline:
 
         preds_matrix = np.array([m.predict_proba(X_degraded) for m in self.models])  # (K, N)
         p_mean = np.mean(preds_matrix, axis=0)  # (N,)
-        p_var = np.var(preds_matrix, axis=0, ddof=1)  # (N,)
+        ddof_val = 1 if len(self.models) > 1 else 0
+        p_var = np.var(preds_matrix, axis=0, ddof=ddof_val)  # (N,)
 
         rejected_mask = p_var > self.variance_rejection_thresh
 
