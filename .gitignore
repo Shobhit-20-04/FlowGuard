@@ -10,6 +10,7 @@ archive_management/
 reproducibility/
 research_data/
 research_results/
+shareable/
 
 # Internal Audit Reports & Detailed Research Artifacts (Local-Only)
 docs/internal/

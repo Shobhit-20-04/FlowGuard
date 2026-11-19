@@ -86,7 +86,11 @@ def cmd_data_validate(args: argparse.Namespace) -> int:
         total_rows += len(df)
         feature_sets.append(set(df.columns))
 
-        label_col = "label" if "label" in df.columns else ("Label" if "Label" in df.columns else None)
+        label_col = None
+        for cand in ["target_label", "label", "Label"]:
+            if cand in df.columns:
+                label_col = cand
+                break
         n_attacks = int(df[label_col].sum()) if label_col else 0
         attack_pct = (n_attacks / max(1, len(df))) * 100
 
